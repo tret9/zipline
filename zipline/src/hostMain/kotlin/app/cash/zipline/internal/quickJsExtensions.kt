@@ -31,6 +31,7 @@ internal fun loadJsModule(quickJs: QuickJs, script: String, id: String) {
   quickJs.evaluate("globalThis.$CURRENT_MODULE_ID = '$id';")
   quickJs.evaluate(script, id)
   quickJs.evaluate("delete globalThis.$CURRENT_MODULE_ID;")
+  warmUpBridges(quickJs, id)
   logBridgeDiagnostics(quickJs)
 }
 
@@ -38,7 +39,55 @@ public fun loadJsModule(quickJs: QuickJs, id: String, bytecode: ByteArray) {
   quickJs.evaluate("globalThis.$CURRENT_MODULE_ID = '$id';")
   quickJs.execute(bytecode)
   quickJs.evaluate("delete globalThis.$CURRENT_MODULE_ID;")
+  warmUpBridges(quickJs, id)
   logBridgeDiagnostics(quickJs)
+}
+
+/**
+ * Name of the exported hook the Kotlin/JS bridge plugin emits per module
+ * (`zipline-bridge-kotlin-plugin`, `JsGenerator.BRIDGE_WARM_UP_FUNCTION_NAME`).
+ */
+private const val BRIDGE_WARM_UP_FUNCTION_NAME = "__bridgeWarmUpHost2Js"
+
+/**
+ * Calls the bridge plugin's `@JsExport __bridgeWarmUpHost2Js()` hook of the module that was just
+ * defined, if it has one. The hook registers every `@WithHost2JSBridge` class of that module
+ * (prototypes + runtime factories) with the host, which is what lets the host build host→JS
+ * payload objects for classes the guest never constructs. Kotlin/JS itself cannot do this
+ * eagerly — file-level property initializers run only when their file is first touched — so it
+ * happens here, at module load, before the application runs and therefore before any host→JS
+ * conversion.
+ *
+ * The hook lives wherever the plugin put it (any package of the module), so the export
+ * namespace is searched for a function with that name; only plain namespace objects are
+ * descended into, so no guest instance is touched.
+ */
+private fun warmUpBridges(quickJs: QuickJs, id: String) {
+  val escapedId = id.replace("\\", "\\\\").replace("'", "\\'")
+  quickJs.evaluate(
+    script = """
+      (function () {
+        function find(ns, depth) {
+          if (ns === null || typeof ns !== 'object' || depth > 8) return null;
+          var direct = ns['$BRIDGE_WARM_UP_FUNCTION_NAME'];
+          if (typeof direct === 'function') return direct;
+          var keys = Object.keys(ns);
+          for (var i = 0; i < keys.length; i++) {
+            var value = ns[keys[i]];
+            if (value !== null && typeof value === 'object'
+                && Object.getPrototypeOf(value) === Object.prototype) {
+              var found = find(value, depth + 1);
+              if (found !== null) return found;
+            }
+          }
+          return null;
+        }
+        var hook = find(require('$escapedId'), 0);
+        if (hook) hook();
+      })()
+    """.trimIndent(),
+    fileName = "bridgeWarmUp.js",
+  )
 }
 
 /** Print __define_log after each module — shows which modules have bridge FQNs and registration status. */

@@ -37,16 +37,20 @@ import app.cash.zipline.quickjs.JSContext
 import app.cash.zipline.quickjs.JSValue
 import app.cash.zipline.quickjs.JS_Call
 import app.cash.zipline.quickjs.JS_FreeValue
+import app.cash.zipline.quickjs.JS_GetGlobalObject
 import app.cash.zipline.quickjs.JS_GetPropertyStr
 import app.cash.zipline.quickjs.JS_GetPropertyUint32
 import app.cash.zipline.quickjs.JS_IsArray
 import app.cash.zipline.quickjs.JS_IsBool
 import app.cash.zipline.quickjs.JS_IsException
+import app.cash.zipline.quickjs.JS_IsFunction
 import app.cash.zipline.quickjs.JS_IsNull
 import app.cash.zipline.quickjs.JS_IsNumber
 import app.cash.zipline.quickjs.JS_IsString
+import app.cash.zipline.quickjs.JS_TAG_BOOL
 import app.cash.zipline.quickjs.JS_IsUndefined
 import app.cash.zipline.quickjs.JS_TAG_FLOAT64
+import app.cash.zipline.quickjs.JsUndefined
 import app.cash.zipline.quickjs.JS_TAG_INT
 import app.cash.zipline.quickjs.JS_TAG_OBJECT
 import app.cash.zipline.quickjs.JS_ToCString
@@ -110,6 +114,7 @@ fun JsNumberToInt(jsVal: CValue<JSValue>): Int = when (JsValueGetNormTag(jsVal))
   else -> 0
 }
 
+
 /**
  * Reads the numeric payload of a BOXED Kotlin value class instance as Double.
  * See [JsBoxedNumberToLong]; this variant covers Int/Float/Double wrappers
@@ -118,6 +123,7 @@ fun JsNumberToInt(jsVal: CValue<JSValue>): Int = when (JsValueGetNormTag(jsVal))
 @OptIn(ExperimentalForeignApi::class)
 fun JsBoxedNumberToDouble(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Double? {
   if (JsValueGetNormTag(jsVal) != JS_TAG_OBJECT) return null
+  if (jsIsLong(ctx, jsVal)) return jsLongValue(ctx, jsVal).toDouble()
   return memScoped {
     val count = alloc<IntVar>()
     val ptab = JsGetOwnPropertyNames(ctx, jsVal, count.ptr) ?: return@memScoped null
@@ -146,13 +152,17 @@ fun JsBoxedNumberToDouble(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Dou
  * over Long). Kotlin/JS boxes value-class fields with custom members into plain
  * JS objects whose single backing field is hash-mangled ('uoul_1'-style) and
  * exposes no accessor, so neither a named read nor a bridge converter can reach
- * it. Scan the instance's OWN enumerable properties and take the first numeric
- * value (number or Kotlin/JS Long {low_1, high_1} object). Returns null when the
- * object has no numeric payload.
+ * it. A boxed Kotlin/JS Long itself is handled first (see [jsLongValue]);
+ * otherwise scan the instance's OWN enumerable properties and take the first
+ * numeric value (number or nested Kotlin/JS Long {low_1, high_1} object).
+ * Returns null when the object has no numeric payload.
  */
 @OptIn(ExperimentalForeignApi::class)
 fun JsBoxedNumberToLong(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Long? {
   if (JsValueGetNormTag(jsVal) != JS_TAG_OBJECT) return null
+  // The guest reports the halves (Kotlin/JS mangles the box's fields and the stdlib's); only the
+  // shape scan below remains for boxes nothing else recognizes.
+  if (jsIsLong(ctx, jsVal)) return jsLongValue(ctx, jsVal)
   return memScoped {
     val count = alloc<IntVar>()
     val ptab = JsGetOwnPropertyNames(ctx, jsVal, count.ptr) ?: return@memScoped null
@@ -190,24 +200,194 @@ fun JsBoxedNumberToLong(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Long?
 }
 
 /**
- * Read a JS number as Long, handling JS_TAG_INT, JS_TAG_FLOAT64,
- * and Kotlin/JS Long objects {low_1, high_1}.
+ * Read a JS number as Long, handling JS_TAG_INT, JS_TAG_FLOAT64 and boxed kotlin.Long values
+ * (whose halves the guest reports: Kotlin/JS mangles `low`/`high`).
  */
 @OptIn(ExperimentalForeignApi::class)
 fun JsNumberToLong(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Long = when (JsValueGetNormTag(jsVal)) {
   JS_TAG_INT -> JsValueGetInt(jsVal).toLong()
   JS_TAG_FLOAT64 -> JsValueGetFloat64(jsVal).toLong()
-  else -> {
-    val lowVal = JS_GetPropertyStr(ctx, jsVal, "low_1")
-    val highVal = JS_GetPropertyStr(ctx, jsVal, "high_1")
-    val low = JsNumberToInt(lowVal)
-    val high = JsNumberToInt(highVal)
-    val result = (high.toLong() shl 32) or (low.toLong() and 0xFFFFFFFF)
-    JS_FreeValue(ctx, lowVal)
-    JS_FreeValue(ctx, highVal)
-    result
+  // A boxed kotlin.Long: the guest reports its halves, its fields are mangled in Kotlin/JS.
+  else -> jsLongValue(ctx, jsVal)
+}
+
+/** True when [jsVal] is a boxed kotlin.Long, as the guest's value ops report it. */
+private fun jsIsLong(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Boolean {
+  val low = callValueOp(ctx, "longLow", jsVal) ?: return false
+  val isInt = JsValueGetNormTag(low) == JS_TAG_INT
+  JS_FreeValue(ctx, low)
+  return isInt
+}
+
+/** The value of the boxed kotlin.Long in [jsVal]; fails loudly when it is not one. */
+private fun jsLongValue(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Long {
+  val low = callValueOp(ctx, "longLow", jsVal)
+  if (low != null && JsValueGetNormTag(low) == JS_TAG_INT) {
+    val high = callValueOp(ctx, "longHigh", jsVal)
+    val highInt = if (high != null && JsValueGetNormTag(high) == JS_TAG_INT) JsValueGetInt(high) else 0
+    if (high != null) JS_FreeValue(ctx, high)
+    val result = (highInt.toLong() shl 32) or (JsValueGetInt(low).toLong() and 0xFFFFFFFFL)
+    JS_FreeValue(ctx, low)
+    return result
+  }
+  if (low != null) JS_FreeValue(ctx, low)
+  error("not a kotlin.Long: the guest value ops reported no low/high halves for this value")
+}
+
+/** Ordinal of the enum instance in [jsVal], or -1 when it isn't an enum. */
+public fun jsEnumOrdinal(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Int {
+  val ordinal = callValueOp(ctx, "enumOrdinal", jsVal)
+  if (ordinal != null) {
+    val result = if (JsValueGetNormTag(ordinal) == JS_TAG_INT) JsValueGetInt(ordinal) else -1
+    JS_FreeValue(ctx, ordinal)
+    if (result >= 0) return result
+  }
+  return -1
+}
+
+/**
+ * The guest's value accessors, installed by `app.cash.zipline.publishValueOps()` from the
+ * bridge plugin's module-load hook and fetched once per runtime. Kotlin/JS mangles the member names
+ * of the stdlib collections (production builds drop the original names entirely) and there is no
+ * single collection prototype to mark, so the guest answers the type question with the compiler's
+ * own `is` check and drives the iteration. Every call here is O(1); nothing is copied guest-side.
+ */
+private fun valueOps(ctx: CPointer<JSContext>): CValue<JSValue>? {
+  val quickJs = quickJsFor(ctx)
+  quickJs.bridgeValueOps?.let { return it }
+  val global = JS_GetGlobalObject(ctx)
+  val ops = JS_GetPropertyStr(ctx, global, "__zipline_bridgeValueOps")
+  JS_FreeValue(ctx, global)
+  if (JS_IsUndefined(ops) != 0) {
+    JS_FreeValue(ctx, ops)
+    return null
+  }
+  quickJs.bridgeValueOps = ops
+  return ops
+}
+
+/** Calls `ops.<name>(argument)`; returns the result (caller frees), or null when unavailable. */
+private fun callValueOp(
+  ctx: CPointer<JSContext>,
+  name: String,
+  argument: CValue<JSValue>,
+): CValue<JSValue>? {
+  val ops = valueOps(ctx) ?: return null
+  val fn = JS_GetPropertyStr(ctx, ops, name)
+  if (JS_IsFunction(ctx, fn) == 0) {
+    JS_FreeValue(ctx, fn)
+    return null
+  }
+  val result = memScoped {
+    val args = allocArrayOf(argument)
+    JS_Call(ctx, fn, JsUndefined(), 1, args)
+  }
+  JS_FreeValue(ctx, fn)
+  if (JS_IsException(result) != 0) {
+    JS_FreeValue(ctx, result)
+    return null
+  }
+  return result
+}
+
+/**
+ * How the guest classified an opaque JS value, from the value-ops `kind` call. The codes are the
+ * guest's own (`BridgeValueOps` on the JS side). A JS array is never one of these: it is decoded
+ * before [collectionKind] is consulted.
+ */
+enum class CollectionKind(val code: Int) {
+  NONE(0),
+  MAP(1),
+  SET(2),
+  LIST(3),
+  ;
+
+  companion object {
+    /** The kind [code] stands for, or [NONE] when the guest sent a code this build doesn't know. */
+    fun of(code: Int): CollectionKind = when (code) {
+      MAP.code -> MAP
+      SET.code -> SET
+      LIST.code -> LIST
+      else -> NONE
+    }
   }
 }
+
+/** The guest's classification of [jsVal], or [CollectionKind.NONE] when it is not a collection. */
+private fun collectionKind(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): CollectionKind {
+  if (JsValueGetNormTag(jsVal) != JS_TAG_OBJECT) return CollectionKind.NONE
+  val kind = callValueOp(ctx, "kind", jsVal) ?: return CollectionKind.NONE
+  val code = if (JsValueGetNormTag(kind) == JS_TAG_INT) JsValueGetInt(kind) else CollectionKind.NONE.code
+  JS_FreeValue(ctx, kind)
+  return CollectionKind.of(code)
+}
+
+/** Builds a LinkedHashSet ([CollectionKind.SET]) or ArrayList ([CollectionKind.LIST]) from the guest's iterator. */
+fun jsCollectionToKotlin(
+  ctx: CPointer<JSContext>,
+  jsVal: CValue<JSValue>,
+  kind: CollectionKind,
+  converter: (CValue<JSValue>) -> Any?,
+): Any {
+  val result: MutableCollection<Any?> = when (kind) {
+    CollectionKind.SET -> LinkedHashSet()
+    else -> ArrayList()
+  }
+  val iterator = callValueOp(ctx, "iterator", jsVal) ?: return result
+  while (true) {
+    val hasNext = callValueOp(ctx, "hasNext", iterator) ?: break
+    val more = JsValueGetNormTag(hasNext) == JS_TAG_BOOL && JsValueGetBool(hasNext) != 0
+    JS_FreeValue(ctx, hasNext)
+    if (!more) break
+    val element = callValueOp(ctx, "next", iterator) ?: break
+    result.add(converter(element))
+    JS_FreeValue(ctx, element)
+  }
+  JS_FreeValue(ctx, iterator)
+  return result
+}
+
+/**
+ * Throws when [jsVal] looks like a Kotlin class instance that no bridge converter was registered
+ * for, naming the class; returns null for plain data shapes (JS objects, Kotlin collections),
+ * which is how they decoded before. See the call site in [bridgeForAny].
+ */
+private fun throwUnbridgedJsObject(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Any? {
+  // A function value is not a data payload (it decoded to null before, and zipline has no
+  // function bridge), so leave it alone.
+  if (JS_IsFunction(ctx, jsVal) != 0) return null
+  val ctor = JS_GetPropertyStr(ctx, jsVal, "constructor")
+  if (JS_IsUndefined(ctor) != 0 || JS_IsNull(ctor) != 0 || JS_IsFunction(ctx, ctor) == 0) {
+    JS_FreeValue(ctx, ctor)
+    return null
+  }
+  val ctorName = JS_GetPropertyStr(ctx, ctor, "name")
+  val ctorCString = JS_ToCString(ctx, ctorName)
+  val className = ctorCString?.toKStringFromUtf8().orEmpty()
+  if (ctorCString != null) JS_FreeCString(ctx, ctorCString)
+  JS_FreeValue(ctx, ctorName)
+  JS_FreeValue(ctx, ctor)
+  if (className.isEmpty() || className in UNBRIDGED_DECODE_EXEMPT_CLASSES) return null
+  throw IllegalStateException(
+    "host bridge: no converter registered for JS class '$className'; " +
+      "annotate the class with @WithJS2HostBridge to send it to the host",
+  )
+}
+
+/**
+ * JS built-ins (plain objects, arrays, dates, …) and Kotlin's collection/long wrappers decode
+ * without a bridge converter; everything else that arrives as a class instance must have one.
+ */
+private val UNBRIDGED_DECODE_EXEMPT_CLASSES = setOf(
+  "Object", "Array", "Function", "Date", "RegExp", "Error", "Promise", "Symbol",
+  "Number", "String", "Boolean", "BigInt", "JSON", "Math", "Reflect", "Proxy",
+  "ArrayBuffer", "DataView", "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array",
+  "Uint16Array", "Int32Array", "Uint32Array", "Float32Array", "Float64Array",
+  "BigInt64Array", "BigUint64Array", "Map", "Set", "WeakMap", "WeakSet",
+  "LinkedHashMap", "HashMap", "ArrayList", "LinkedHashSet", "HashSet", "ArrayDeque", "Long",
+  // kotlin.Unit: the result of a Unit-returning guest function (e.g. the direct-event sink).
+  "Unit",
+)
 
 /**
  * Dispatch a single JS value to its Kotlin equivalent using bridge_dispatch for objects.
@@ -242,6 +422,16 @@ fun bridgeForAny(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Any? = when 
   }
   JS_IsUndefined(jsVal) != 0 || JS_IsNull(jsVal) != 0 -> null
   else -> {
+    // Kotlin/JS collection (map/set/list): the guest identifies it and drives the iteration.
+    when (val kind = collectionKind(ctx, jsVal)) {
+      CollectionKind.MAP -> return jsMapToKotlin(
+        ctx, jsVal, { element -> bridgeForAny(ctx, element) },
+        { element -> bridgeForAny(ctx, element) },
+      )
+      CollectionKind.SET, CollectionKind.LIST ->
+        return jsCollectionToKotlin(ctx, jsVal, kind) { element -> bridgeForAny(ctx, element) }
+      CollectionKind.NONE -> Unit
+    }
     val dispatch = JS_GetPropertyStr(ctx, jsVal, "bridge_dispatch")
     if (JS_IsUndefined(dispatch) == 0) {
       val fn = JsValueGetFloat64(dispatch).toRawBits().toCPointer<UByteVar>()!!.asStableRef<(CPointer<JSContext>, CValue<JSValue>) -> Any>()
@@ -250,31 +440,12 @@ fun bridgeForAny(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Any? = when 
       r
     } else {
       JS_FreeValue(ctx, dispatch)
-      // Check for Kotlin/JS Long: {low_1, high_1} with constructor.name === "Long"
-      val lo = JS_GetPropertyStr(ctx, jsVal, "low_1")
-      if (JS_IsUndefined(lo) == 0) {
-        val ctor = JS_GetPropertyStr(ctx, jsVal, "constructor")
-        var isLong = false
-        if (JS_IsUndefined(ctor) == 0) {
-          val ctorName = JS_GetPropertyStr(ctx, ctor, "name")
-          val ctorNameStr = JS_ToCString(ctx, ctorName)
-          isLong = ctorNameStr?.toKStringFromUtf8() == "Long"
-          JS_FreeCString(ctx, ctorNameStr)
-          JS_FreeValue(ctx, ctorName)
-        }
-        JS_FreeValue(ctx, ctor)
-        if (isLong) {
-          val hi = JS_GetPropertyStr(ctx, jsVal, "high_1")
-          val loVal = JsNumberToInt(lo).toLong() and 0xFFFFFFFFL
-          val hiVal = JsNumberToInt(hi).toLong() shl 32
-          val lv = hiVal or loVal
-          JS_FreeValue(ctx, hi)
-          JS_FreeValue(ctx, lo)
-          return lv
-        }
-        JS_FreeValue(ctx, lo)
-      }
-      null
+      // A boxed kotlin.Long: the guest identifies it (Kotlin/JS mangles the fields of the box).
+      if (jsIsLong(ctx, jsVal)) return jsLongValue(ctx, jsVal)
+      // 3) No converter: a class instance that cannot be decoded. Returning null here used to
+      // surface as a confusing cast/NPE far from the cause (e.g. a List<TopBarIcon> arriving as
+      // [null] because TopBarIcon was not annotated), so name the class instead.
+      throwUnbridgedJsObject(ctx, jsVal)
     }
   }
 }
@@ -285,109 +456,29 @@ fun bridgeForAny(ctx: CPointer<JSContext>, jsVal: CValue<JSValue>): Any? = when 
  * supplied converters. Used by generated bridge code for Map fields.
  */
 @OptIn(ExperimentalForeignApi::class)
-public fun jsMapToKotlin(
+public fun <K, V> jsMapToKotlin(
   ctx: CPointer<JSContext>,
   jsVal: CValue<JSValue>,
-  keyConverter: (CValue<JSValue>) -> Any,
-  valueConverter: (CValue<JSValue>) -> Any,
-): Map<Any, Any> {
-  val result = mutableMapOf<Any, Any>()
-  // Kotlin/JS exposes Map iteration only through mangled methods (get_entries_*, iterator_*,
-  // hasNext_*, next_*, get_key_*, get_value_*) with stable prefixes; discover the exact names
-  // at runtime and call them via JS_Call.
-  fun protoNames(obj: CValue<JSValue>): List<String> {
-    // Kotlin/JS methods live on the prototype chain (constructor.prototype + __proto__ parents);
-    // own properties are only fields. Walk the chain collecting method names.
-    val result = mutableListOf<String>()
-    val constructor = JS_GetPropertyStr(ctx, obj, "constructor")
-    var proto = JS_GetPropertyStr(ctx, constructor, "prototype")
-    JS_FreeValue(ctx, constructor)
-    while (JS_IsUndefined(proto) == 0 && JS_IsNull(proto) == 0) {
-      val names = memScoped {
-        val count = alloc<IntVar>()
-        val ptab = JsGetOwnPropertyNames(ctx, proto, count.ptr)
-        if (ptab == null) {
-          emptyList()
-        } else {
-          val list = (0 until count.value).mapNotNull { i ->
-            JsGetPropertyName(ctx, ptab, i)?.toKStringFromUtf8()
-          }
-          JsFreePropertyEnum(ctx, ptab)
-          list
-        }
-      }
-      result.addAll(names)
-      val parent = JS_GetPropertyStr(ctx, proto, "__proto__")
-      JS_FreeValue(ctx, proto)
-      proto = parent
-    }
-    JS_FreeValue(ctx, proto)
-    return result
-  }
-  fun findMethod(protoNames: List<String>, prefix: String): String? =
-    protoNames.firstOrNull { it.startsWith(prefix) }
-
-  val mapNames = protoNames(jsVal)
-  val entriesName = findMethod(mapNames, "get_entries_") ?: return result
-  val entriesFn = JS_GetPropertyStr(ctx, jsVal, entriesName)
-  val entries = JS_Call(ctx, entriesFn, jsVal, 0, null)
-  JS_FreeValue(ctx, entriesFn)
-  if (JS_IsException(entries) != 0) {
-    JS_FreeValue(ctx, entries)
-    return result
-  }
-  val entriesNames = protoNames(entries)
-  val iteratorName = findMethod(entriesNames, "iterator_") ?: run {
-    JS_FreeValue(ctx, entries)
-    return result
-  }
-  val iteratorFn = JS_GetPropertyStr(ctx, entries, iteratorName)
-  val iterator = JS_Call(ctx, iteratorFn, entries, 0, null)
-  JS_FreeValue(ctx, iteratorFn)
-  JS_FreeValue(ctx, entries)
-  if (JS_IsException(iterator) != 0) {
-    JS_FreeValue(ctx, iterator)
-    return result
-  }
-  val iteratorNames = protoNames(iterator)
-  val hasNextName = findMethod(iteratorNames, "hasNext_")
-  val nextName = findMethod(iteratorNames, "next_")
-  if (hasNextName == null || nextName == null) {
-    JS_FreeValue(ctx, iterator)
-    return result
-  }
-  val hasNextFn = JS_GetPropertyStr(ctx, iterator, hasNextName)
-  val nextFn = JS_GetPropertyStr(ctx, iterator, nextName)
+  keyConverter: (CValue<JSValue>) -> K,
+  valueConverter: (CValue<JSValue>) -> V,
+): Map<K, V> {
+  val result = mutableMapOf<K, V>()
+  val iterator = callValueOp(ctx, "iterator", jsVal) ?: return result
   while (true) {
-    val hasNext = JS_Call(ctx, hasNextFn, iterator, 0, null)
-    val hasNextValue = JsValueGetBool(hasNext) != 0
+    val hasNext = callValueOp(ctx, "hasNext", iterator) ?: break
+    val more = JsValueGetNormTag(hasNext) == JS_TAG_BOOL && JsValueGetBool(hasNext) != 0
     JS_FreeValue(ctx, hasNext)
-    if (!hasNextValue) break
-    val entry = JS_Call(ctx, nextFn, iterator, 0, null)
-    if (JS_IsException(entry) != 0) {
-      JS_FreeValue(ctx, entry)
-      break
+    if (!more) break
+    val entry = callValueOp(ctx, "next", iterator) ?: break
+    val rawKey = callValueOp(ctx, "key", entry)
+    val rawValue = callValueOp(ctx, "value", entry)
+    if (rawKey != null && rawValue != null) {
+      result[keyConverter(rawKey)] = valueConverter(rawValue)
+      JS_FreeValue(ctx, rawValue)
+      JS_FreeValue(ctx, rawKey)
     }
-    val entryNames = protoNames(entry)
-    val keyName = findMethod(entryNames, "get_key_")
-    val valueName = findMethod(entryNames, "get_value_")
-    if (keyName == null || valueName == null) {
-      JS_FreeValue(ctx, entry)
-      break
-    }
-    val keyFn = JS_GetPropertyStr(ctx, entry, keyName)
-    val valueFn = JS_GetPropertyStr(ctx, entry, valueName)
-    val keyRaw = JS_Call(ctx, keyFn, entry, 0, null)
-    val valueRaw = JS_Call(ctx, valueFn, entry, 0, null)
-    JS_FreeValue(ctx, keyFn)
-    JS_FreeValue(ctx, valueFn)
-    result[keyConverter(keyRaw)] = valueConverter(valueRaw)
-    JS_FreeValue(ctx, valueRaw)
-    JS_FreeValue(ctx, keyRaw)
     JS_FreeValue(ctx, entry)
   }
-  JS_FreeValue(ctx, nextFn)
-  JS_FreeValue(ctx, hasNextFn)
   JS_FreeValue(ctx, iterator)
   return result
 }

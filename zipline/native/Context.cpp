@@ -70,9 +70,24 @@ jmethodID Context::rdmaBridgeJsonNull = nullptr;
 jmethodID Context::rdmaBridgeCreateJsonArray = nullptr;
 jmethodID Context::rdmaBridgeCreateJsonObject = nullptr;
 jclass Context::arrayListClass = nullptr;
+jclass Context::objectArrayClass = nullptr;
+jclass Context::intArrayClass = nullptr;
+jclass Context::longArrayClass = nullptr;
+jclass Context::doubleArrayClass = nullptr;
+jclass Context::floatArrayClass = nullptr;
+jclass Context::booleanArrayClass = nullptr;
+jclass Context::shortArrayClass = nullptr;
+jclass Context::byteArrayClass = nullptr;
+jclass Context::characterArrayClass = nullptr;
 jmethodID Context::arrayListInit = nullptr;
 jmethodID Context::arrayListInitWithCapacity = nullptr;
 jmethodID Context::arrayListAdd = nullptr;
+jclass Context::linkedHashMapClass = nullptr;
+jmethodID Context::linkedHashMapInit = nullptr;
+jmethodID Context::mapPut = nullptr;
+jclass Context::linkedHashSetClass = nullptr;
+jmethodID Context::linkedHashSetInit = nullptr;
+jmethodID Context::setAdd = nullptr;
 jmethodID Context::rdmaSinkCreateCreate = nullptr;
 jmethodID Context::rdmaSinkCreatePropertyChange = nullptr;
 jmethodID Context::rdmaSinkCreateModifierChange = nullptr;
@@ -85,6 +100,32 @@ jmethodID Context::rdmaSinkSendBatch = nullptr;
 jmethodID Context::rdmaSinkSendChanges = nullptr;
 jclass Context::pairClass = nullptr;
 jmethodID Context::pairInit = nullptr;
+jclass Context::floatClass = nullptr;
+jclass Context::shortClass = nullptr;
+jclass Context::byteClass = nullptr;
+jclass Context::characterClass = nullptr;
+jclass Context::listClass = nullptr;
+jclass Context::mapClass = nullptr;
+jclass Context::mapEntryClass = nullptr;
+jclass Context::setClass = nullptr;
+jclass Context::iteratorClass = nullptr;
+jmethodID Context::integerIntValue = nullptr;
+jmethodID Context::longLongValue = nullptr;
+jmethodID Context::doubleDoubleValue = nullptr;
+jmethodID Context::floatFloatValue = nullptr;
+jmethodID Context::booleanBooleanValue = nullptr;
+jmethodID Context::shortShortValue = nullptr;
+jmethodID Context::byteByteValue = nullptr;
+jmethodID Context::characterCharValue = nullptr;
+jmethodID Context::objectToString = nullptr;
+jmethodID Context::listSize = nullptr;
+jmethodID Context::listGet = nullptr;
+jmethodID Context::mapEntrySet = nullptr;
+jmethodID Context::setIterator = nullptr;
+jmethodID Context::iteratorHasNext = nullptr;
+jmethodID Context::iteratorNext = nullptr;
+jmethodID Context::entryGetKey = nullptr;
+jmethodID Context::entryGetValue = nullptr;
 std::once_flag Context::staticsInitFlag;
 
 extern "C" __attribute__((used, visibility("default"))) void addBridgeEntry(const char* fq, BridgeConverterFn fn) {
@@ -101,40 +142,93 @@ extern "C" __attribute__((used, visibility("default"))) void init_all(JNIEnv* en
     }
 }
 
-// Shared __bridgeRegister JS function — looks up FQNs in the dynamic bridgeTable.
+// Shared __bridgeRegister JS function — looks up FQNs in the dynamic bridgeTable. Lenient:
+// the class prototype is always retained (host2js instance creation) and bridge_dispatch is
+// set only when a JS2Host converter exists; unknown FQNs are logged, never thrown (host2js-only
+// classes have no converter entry).
 static JSValue bridge_register_js(JSContext *ctx, JSValueConst this_val,
     int argc, JSValueConst *argv) {
     if (argc < 2) return JS_UNDEFINED;
-    if (bridgeTable.empty()) return JS_UNDEFINED;
     const char *fq = JS_ToCString(ctx, argv[0]);
     if (!fq) return JS_UNDEFINED;
     JSValue ctor = argv[1];
     if (JS_IsUndefined(ctor)) { JS_FreeCString(ctx, fq); return JS_UNDEFINED; }
-    for (auto& entry : bridgeTable) {
-        if (strcmp(entry.first.c_str(), fq) == 0) {
-            JSValue proto = JS_GetPropertyStr(ctx, ctor, "prototype");
-            JS_SetPropertyStr(ctx, proto, "bridge_dispatch",
-                bridgeConverterToJSValue(ctx, entry.second));
-            JS_FreeValue(ctx, proto);
-            JS_FreeCString(ctx, fq);
-            return JS_UNDEFINED;
+    auto* context = reinterpret_cast<Context*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+    JSValue proto = JS_GetPropertyStr(ctx, ctor, "prototype");
+    if (!JS_IsUndefined(proto) && !JS_IsNull(proto)) {
+        auto it = context->bridgeProtos.find(fq);
+        if (it != context->bridgeProtos.end()) {
+            JS_FreeValue(ctx, it->second);
+        }
+        context->bridgeProtos[fq] = JS_DupValue(ctx, proto);
+        bool found = false;
+        for (auto& entry : bridgeTable) {
+            if (strcmp(entry.first.c_str(), fq) == 0) {
+                JS_SetPropertyStr(ctx, proto, "bridge_dispatch",
+                    bridgeConverterToJSValue(ctx, entry.second));
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_ERROR, "BRIDGE",
+                "bridge_register_js: FQN '%s' not found in bridge_table (host2js-only class)", fq);
+#else
+            printf("BRIDGE: bridge_register_js: FQN '%s' NOT FOUND in bridge_table (host2js-only class)\n", fq);
+#endif
         }
     }
-#if defined(__ANDROID__)
-    __android_log_print(ANDROID_LOG_ERROR, "BRIDGE",
-        "bridge_register_js: FQN '%s' not found in bridge_table", fq);
-#else
-    printf("BRIDGE: bridge_register_js: FQN '%s' NOT FOUND in bridge_table\n", fq);
-#endif
-    JS_ThrowTypeError(ctx, "bridge_register_js: FQN '%s' not found in bridge_table", fq);
+    JS_FreeValue(ctx, proto);
     JS_FreeCString(ctx, fq);
-    return JS_EXCEPTION;
+    return JS_UNDEFINED;
 }
 
+// __bridgeRegisterRuntime — the guest's module-load call registering its __BridgeRuntimeFactories
+// object (methods newLong/newArrayList/newLinkedHashMap). The host retains the three methods
+// per-context and calls them via JS_Call to build real Kotlin/JS collection/Long instances.
+static JSValue bridge_register_runtime_js(JSContext *ctx, JSValueConst this_val,
+    int argc, JSValueConst *argv) {
+    if (argc < 1) {
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_ERROR, "BRIDGE",
+            "bridge_register_runtime_js: expected 1 arg, got %d", argc);
+#else
+        printf("BRIDGE: bridge_register_runtime_js: expected 1 arg, got %d\n", argc);
+#endif
+        return JS_UNDEFINED;
+    }
+    auto* context = reinterpret_cast<Context*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+    JS_FreeValue(ctx, context->bridgeNewLong);
+    JS_FreeValue(ctx, context->bridgeNewArrayList);
+    JS_FreeValue(ctx, context->bridgeNewLinkedHashMap);
+    {
+      JSValue cc = JS_GetPropertyStr(ctx, argv[0], "constructor");
+      JSValue p2 = JS_GetPropertyStr(ctx, cc, "prototype");
+      JS_FreeValue(ctx, cc);
+      if (JS_VALUE_GET_NORM_TAG(p2) == JS_TAG_OBJECT) {
+        JSPropertyEnum* pt = NULL; uint32_t pl = 0;
+        if (JS_GetOwnPropertyNames(ctx, &pt, &pl, p2, JS_GPN_STRING_MASK) == 0) {
+          for (uint32_t i = 0; i < pl; i++) {
+            const char* k = JS_AtomToCString(ctx, pt[i].atom);
+            if (k != NULL) JS_FreeCString(ctx, k);
+          }
+          js_free(ctx, pt);
+        }
+      }
+      JS_FreeValue(ctx, p2);
+    }
+    context->bridgeNewLong = JS_GetPropertyStr(ctx, argv[0], "newLong");
+    context->bridgeNewArrayList = JS_GetPropertyStr(ctx, argv[0], "newArrayList");
+    context->bridgeNewLinkedHashMap = JS_GetPropertyStr(ctx, argv[0], "newLinkedHashMap");
+    return JS_UNDEFINED;
+}
 extern "C" __attribute__((used, visibility("default"))) void register_all(JSContext* ctx) {
     JSValue global = JS_GetGlobalObject(ctx);
     JS_SetPropertyStr(ctx, global, "__bridgeRegister",
         JS_NewCFunction(ctx, bridge_register_js, "__bridgeRegister", 2));
+    JS_SetPropertyStr(ctx, global, "__bridgeRegisterRuntime",
+        JS_NewCFunction(ctx, bridge_register_runtime_js, "__bridgeRegisterRuntime", 3));
     JS_FreeValue(ctx, global);
 }
 
@@ -194,7 +288,10 @@ Context::Context(JNIEnv* env)
       lengthAtom(JS_NewAtom(jsContext, "length")),
       callAtom(JS_NewAtom(jsContext, "call")),
       disconnectAtom(JS_NewAtom(jsContext, "disconnect")),
-      interruptHandler(nullptr) {
+      interruptHandler(nullptr),
+      bridgeNewLong(JS_UNDEFINED),
+      bridgeNewArrayList(JS_UNDEFINED),
+      bridgeNewLinkedHashMap(JS_UNDEFINED) {
   // Class refs and method IDs are process-wide; fetch them once for the JVM.
   ensureStatics(env);
   pendingChanges.reserve(BATCH_SIZE);
@@ -227,6 +324,13 @@ Context::~Context() {
     env->DeleteGlobalRef(interruptHandler);
   }
   deleteBridgeRefs(env);
+  for (auto& entry : bridgeProtos) {
+    JS_FreeValue(jsContext, entry.second);
+  }
+  bridgeProtos.clear();
+  JS_FreeValue(jsContext, bridgeNewLong);
+  JS_FreeValue(jsContext, bridgeNewArrayList);
+  JS_FreeValue(jsContext, bridgeNewLinkedHashMap);
   JS_FreeAtom(jsContext, lengthAtom);
   JS_FreeAtom(jsContext, callAtom);
   JS_FreeAtom(jsContext, disconnectAtom);
@@ -253,8 +357,12 @@ jobject Context::execute(JNIEnv* env, jbyteArray byteCode) {
   }
 
   auto val = JS_EvalFunction(jsContext, obj);
-  jobject result;
-  if (!JS_IsException(val)) {
+  jobject result = nullptr;
+  if (env->ExceptionCheck()) {
+    // A Java exception the host bridge threw while the module ran (its load hook calls the host)
+    // is already pending. Calling into JNI again here aborts the VM, so let it propagate.
+    result = nullptr;
+  } else if (!JS_IsException(val)) {
     result = toJavaObject(env, val, false);
   } else {
     result = nullptr;
@@ -435,32 +543,107 @@ void Context::setOutboundCallChannel(JNIEnv* env, jstring name, jobject callChan
 }
 
 
-__attribute__((used, visibility("default"))) jobject bridgeTryUnwrapLong(JNIEnv *env, JSContext *ctx, JSValue val) {
-  JSValue lo = JS_GetPropertyStr(ctx, val, "low_1");
-  if (JS_IsUndefined(lo)) return nullptr;
+static JSValue valueOps(JSContext* ctx);
+static JSValue callValueOp(JSContext* ctx, JSValue ops, const char* name, JSValue argument);
 
-  JSValue ctor = JS_GetPropertyStr(ctx, val, "constructor");
-  int isLong = 0;
-  if (!JS_IsUndefined(ctor)) {
-    JSValue ctorName = JS_GetPropertyStr(ctx, ctor, "name");
-    const char* ctorNameStr = JS_ToCString(ctx, ctorName);
-    isLong = (ctorNameStr != nullptr && strcmp(ctorNameStr, "Long") == 0);
-    JS_FreeCString(ctx, ctorNameStr);
-    JS_FreeValue(ctx, ctorName);
+/**
+ * The 32-bit halves of the boxed `kotlin.Long` in [val], as reported by the guest (the fields of a
+ * Kotlin/JS Long are mangled and disappear in production builds). Returns 0 for other values.
+ */
+
+extern "C" __attribute__((used, visibility("default"))) jlong bridgeJsLongValue(JNIEnv* env, JSContext* ctx, JSValue val) {
+  if (JS_VALUE_GET_NORM_TAG(val) != JS_TAG_OBJECT) return 0;
+  JSValue ops = valueOps(ctx);
+  if (JS_IsUndefined(ops)) {
+    JS_FreeValue(ctx, ops);
+    return 0;
   }
-  JS_FreeValue(ctx, ctor);
+  JSValue low = callValueOp(ctx, ops, "longLow", val);
+  JSValue high = callValueOp(ctx, ops, "longHigh", val);
+  jlong result = 0;
+  if (JS_VALUE_GET_NORM_TAG(low) == JS_TAG_INT && JS_VALUE_GET_NORM_TAG(high) == JS_TAG_INT) {
+    result = ((jlong)JS_VALUE_GET_INT(high) << 32) | ((jlong)JS_VALUE_GET_INT(low) & 0xFFFFFFFFLL);
+  }
+  JS_FreeValue(ctx, high);
+  JS_FreeValue(ctx, low);
+  JS_FreeValue(ctx, ops);
+  return result;
+}
 
-  if (!isLong) {
-    JS_FreeValue(ctx, lo);
+/** Ordinal of the enum instance in [val], or -1 when it isn't an enum. */
+extern "C" __attribute__((used, visibility("default"))) jint bridgeJsEnumOrdinal(JNIEnv* env, JSContext* ctx, JSValue val) {
+  JSValue ops = valueOps(ctx);
+  if (JS_IsUndefined(ops)) {
+    JS_FreeValue(ctx, ops);
+    return -1;
+  }
+  JSValue ordinal = callValueOp(ctx, ops, "enumOrdinal", val);
+  jint result = JS_VALUE_GET_NORM_TAG(ordinal) == JS_TAG_INT ? JS_VALUE_GET_INT(ordinal) : -1;
+  JS_FreeValue(ctx, ordinal);
+  JS_FreeValue(ctx, ops);
+  if (result >= 0) return result;
+
+  // An object the host itself built for a host->JS conversion carries the ordinal under this name
+  // (the host chooses it, so it is stable — only Kotlin/JS's own member names get mangled).
+  JSValue hostOrdinal = JS_GetPropertyStr(ctx, val, "ordinal_1");
+  result = JS_VALUE_GET_NORM_TAG(hostOrdinal) == JS_TAG_INT ? JS_VALUE_GET_INT(hostOrdinal) : -1;
+  JS_FreeValue(ctx, hostOrdinal);
+  return result;
+}
+
+/**
+ * The guest's collection accessors, installed by `app.cash.zipline.publishValueOps()` from the
+ * bridge plugin's module-load hook, fetched once per runtime. Kotlin/JS mangles the member names of
+ * the stdlib collections (production builds drop the original names entirely) and there is no
+ * single collection prototype to mark, so the guest answers the type question with the compiler's
+ * own `is` check and drives the iteration. Every call here is O(1); nothing is copied guest-side.
+ */
+static JSValue valueOps(JSContext* ctx) {
+  auto* context = reinterpret_cast<Context*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+  if (JS_IsUndefined(context->bridgeValueOps)) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    context->bridgeValueOps =
+        JS_GetPropertyStr(ctx, global, "__zipline_bridgeValueOps");
+    JS_FreeValue(ctx, global);
+  }
+  return JS_DupValue(ctx, context->bridgeValueOps);
+}
+
+/** Calls `ops.<name>(argument)`; returns the raw result (caller frees). */
+static JSValue callValueOp(JSContext* ctx, JSValue ops, const char* name, JSValue argument) {
+  JSValue fn = JS_GetPropertyStr(ctx, ops, name);
+  if (!JS_IsFunction(ctx, fn)) {
+    JS_FreeValue(ctx, fn);
+    return JS_DupValue(ctx, JS_UNDEFINED);
+  }
+  JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 1, &argument);
+  JS_FreeValue(ctx, fn);
+  if (JS_IsException(result)) {
+    JS_FreeValue(ctx, result);
+    return JS_DupValue(ctx, JS_UNDEFINED);
+  }
+  return result;
+}
+
+extern "C" __attribute__((used, visibility("default"))) jobject bridgeTryUnwrapLong(JNIEnv *env, JSContext *ctx, JSValue val) {
+  if (JS_VALUE_GET_NORM_TAG(val) != JS_TAG_OBJECT) return nullptr;
+  // The guest reports whether this is a Long (and its halves): Kotlin/JS mangles the fields.
+  JSValue ops = valueOps(ctx);
+  if (JS_IsUndefined(ops)) {
+    JS_FreeValue(ctx, ops);
     return nullptr;
   }
-
-  JSValue hi = JS_GetPropertyStr(ctx, val, "high_1");
-  jint loVal = JS_VALUE_GET_INT(lo);
-  jint hiVal = JS_VALUE_GET_INT(hi);
-  jlong lv = ((jlong)hiVal << 32) | ((jlong)loVal & 0xFFFFFFFF);
-  JS_FreeValue(ctx, hi);
-  JS_FreeValue(ctx, lo);
+  JSValue low = callValueOp(ctx, ops, "longLow", val);
+  if (JS_VALUE_GET_NORM_TAG(low) != JS_TAG_INT) {
+    JS_FreeValue(ctx, low);
+    JS_FreeValue(ctx, ops);
+    return nullptr;
+  }
+  JSValue high = callValueOp(ctx, ops, "longHigh", val);
+  jlong lv = ((jlong)JS_VALUE_GET_INT(high) << 32) | ((jlong)JS_VALUE_GET_INT(low) & 0xFFFFFFFFLL);
+  JS_FreeValue(ctx, high);
+  JS_FreeValue(ctx, low);
+  JS_FreeValue(ctx, ops);
 
   auto* context = reinterpret_cast<Context*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
   jvalue v;
@@ -468,7 +651,152 @@ __attribute__((used, visibility("default"))) jobject bridgeTryUnwrapLong(JNIEnv 
   return env->CallStaticObjectMethodA(context->longClass, context->longValueOf, &v);
 }
 
-__attribute__((used, visibility("default"))) jobject bridgeForAny(JNIEnv *env, JSContext *ctx, JSValue val) {
+/**
+ * JS built-ins (plain objects, arrays, dates, …) and Kotlin's collection/long wrappers decode
+ * without a bridge converter; everything else that arrives as a class instance must have one.
+ */
+static bool isUnbridgedDecodeExemptClass(const std::string& name) {
+  static const char* kExempt[] = {
+    "Object", "Array", "Function", "Date", "RegExp", "Error", "Promise", "Symbol",
+    "Number", "String", "Boolean", "BigInt", "JSON", "Math", "Reflect", "Proxy",
+    "ArrayBuffer", "DataView", "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array",
+    "Uint16Array", "Int32Array", "Uint32Array", "Float32Array", "Float64Array",
+    "BigInt64Array", "BigUint64Array", "Map", "Set", "WeakMap", "WeakSet",
+    // kotlin.Unit: the result of a Unit-returning guest function (e.g. the direct-event sink).
+    "Unit",
+  };
+  for (const char* exempt : kExempt) {
+    if (name == exempt) return true;
+  }
+  return false;
+}
+
+/**
+ * Throw IllegalStateException naming the JS class of [val] when it looks like a Kotlin class
+ * instance that no bridge converter was registered for. Plain data shapes (JS objects, Kotlin
+ * collections) are left to the caller's null, which is how they decoded before.
+ */
+static void throwUnbridgedJsObject(JNIEnv* env, JSContext* ctx, JSValue val) {
+  // A function value is not a data payload (it decoded to null before, and zipline has no
+  // function bridge), so leave it alone.
+  if (JS_IsFunction(ctx, val)) return;
+  JSValue ctor = JS_GetPropertyStr(ctx, val, "constructor");
+  if (JS_IsUndefined(ctor) || JS_IsNull(ctor) || !JS_IsFunction(ctx, ctor)) {
+    JS_FreeValue(ctx, ctor);
+    return;
+  }
+  JSValue ctorName = JS_GetPropertyStr(ctx, ctor, "name");
+  const char* name = JS_ToCString(ctx, ctorName);
+  std::string className = name != nullptr ? name : "";
+  if (name != nullptr) JS_FreeCString(ctx, name);
+  JS_FreeValue(ctx, ctorName);
+  JS_FreeValue(ctx, ctor);
+  if (className.empty() || isUnbridgedDecodeExemptClass(className)) return;
+
+  std::string message = "host bridge: no converter registered for JS class '" + className +
+                        "'; annotate the class with @WithJS2HostBridge to send it to the host";
+  env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), message.c_str());
+}
+
+/** How the guest classified [val], or COLLECTION_KIND_NONE when it is not a collection. */
+static CollectionKind bridgeCollectionKind(JSContext* ctx, JSValue val) {
+  if (JS_VALUE_GET_NORM_TAG(val) != JS_TAG_OBJECT) return COLLECTION_KIND_NONE;
+  JSValue ops = valueOps(ctx);
+  if (JS_IsUndefined(ops)) {
+    JS_FreeValue(ctx, ops);
+    return COLLECTION_KIND_NONE;
+  }
+  JSValue kind = callValueOp(ctx, ops, "kind", val);
+  JS_FreeValue(ctx, ops);
+  CollectionKind result = JS_VALUE_GET_NORM_TAG(kind) == JS_TAG_INT
+      ? static_cast<CollectionKind>(JS_VALUE_GET_INT(kind)) : COLLECTION_KIND_NONE;
+  JS_FreeValue(ctx, kind);
+  return result;
+}
+
+extern "C" __attribute__((used, visibility("default"))) jobject bridgeCollectionToJava(JNIEnv* env, JSContext* ctx, JSValue val, CollectionKind kind,
+                               BridgeConverterFn keyConverter, BridgeConverterFn valueConverter) {
+  auto* context = reinterpret_cast<Context*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+  jobject result;
+  switch (kind) {
+    case COLLECTION_KIND_MAP:
+      result = env->NewObject(context->linkedHashMapClass, context->linkedHashMapInit);
+      break;
+    case COLLECTION_KIND_SET:
+      result = env->NewObject(context->linkedHashSetClass, context->linkedHashSetInit);
+      break;
+    default:
+      result = env->NewObject(context->arrayListClass, context->arrayListInit);
+      break;
+  }
+  if (env->ExceptionCheck()) {
+    if (result != nullptr) env->DeleteLocalRef(result);
+    return nullptr;
+  }
+
+  // A Kotlin/JS ArrayList IS a JS array, so lists usually need no guest accessors at all: index
+  // them directly.
+  if (kind == COLLECTION_KIND_LIST && JS_IsArray(ctx, val)) {
+    JSValue lenVal = JS_GetPropertyStr(ctx, val, "length");
+    jint length = JS_VALUE_GET_INT(lenVal);
+    JS_FreeValue(ctx, lenVal);
+    for (jint i = 0; i < length && !env->ExceptionCheck(); i++) {
+      JSValue element = JS_GetPropertyUint32(ctx, val, (uint32_t)i);
+      jobject jElement = valueConverter(env, ctx, element);
+      if (jElement != nullptr) {
+        env->CallBooleanMethod(result, context->arrayListAdd, jElement);
+        env->DeleteLocalRef(jElement);
+      }
+      JS_FreeValue(ctx, element);
+    }
+    return result;
+  }
+
+  JSValue ops = valueOps(ctx);
+  if (JS_IsUndefined(ops)) {
+    JS_FreeValue(ctx, ops);
+    return result;
+  }
+  JSValue iterator = callValueOp(ctx, ops, "iterator", val);
+  while (!env->ExceptionCheck()) {
+    JSValue hasNext = callValueOp(ctx, ops, "hasNext", iterator);
+    bool more = JS_VALUE_GET_NORM_TAG(hasNext) == JS_TAG_BOOL && JS_VALUE_GET_BOOL(hasNext);
+    JS_FreeValue(ctx, hasNext);
+    if (!more) break;
+
+    JSValue element = callValueOp(ctx, ops, "next", iterator);
+    if (JS_IsException(element) || JS_IsUndefined(element)) {
+      JS_FreeValue(ctx, element);
+      break;
+    }
+    if (kind == COLLECTION_KIND_MAP) {
+      JSValue rawKey = callValueOp(ctx, ops, "key", element);
+      JSValue rawValue = callValueOp(ctx, ops, "value", element);
+      jobject jKey = keyConverter(env, ctx, rawKey);
+      jobject jValue = valueConverter(env, ctx, rawValue);
+      if (!env->ExceptionCheck() && jKey != nullptr) {
+        env->CallObjectMethod(result, context->mapPut, jKey, jValue);
+      }
+      if (jValue != nullptr) env->DeleteLocalRef(jValue);
+      if (jKey != nullptr) env->DeleteLocalRef(jKey);
+      JS_FreeValue(ctx, rawValue);
+      JS_FreeValue(ctx, rawKey);
+    } else {
+      jobject jElement = valueConverter(env, ctx, element);
+      if (!env->ExceptionCheck() && jElement != nullptr) {
+        env->CallBooleanMethod(
+            result, kind == COLLECTION_KIND_SET ? context->setAdd : context->arrayListAdd, jElement);
+      }
+      if (jElement != nullptr) env->DeleteLocalRef(jElement);
+    }
+    JS_FreeValue(ctx, element);
+  }
+  JS_FreeValue(ctx, iterator);
+  JS_FreeValue(ctx, ops);
+  return result;
+}
+
+extern "C" __attribute__((used, visibility("default"))) jobject bridgeForAny(JNIEnv *env, JSContext *ctx, JSValue val) {
   int tag = JS_VALUE_GET_NORM_TAG(val);
   auto* context = reinterpret_cast<Context*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
 
@@ -476,17 +804,23 @@ __attribute__((used, visibility("default"))) jobject bridgeForAny(JNIEnv *env, J
     case JS_TAG_INT: {
       jvalue v;
       v.j = static_cast<jint>(JS_VALUE_GET_INT(val));
-      return env->CallStaticObjectMethodA(context->integerClass, context->integerValueOf, &v);
+      jobject boxed = env->CallStaticObjectMethodA(context->integerClass, context->integerValueOf, &v);
+      if (env->ExceptionCheck()) return nullptr;
+      return boxed;
     }
     case JS_TAG_FLOAT64: {
       jvalue v;
       v.d = static_cast<jdouble>(JS_VALUE_GET_FLOAT64(val));
-      return env->CallStaticObjectMethodA(context->doubleClass, context->doubleValueOf, &v);
+      jobject boxed = env->CallStaticObjectMethodA(context->doubleClass, context->doubleValueOf, &v);
+      if (env->ExceptionCheck()) return nullptr;
+      return boxed;
     }
     case JS_TAG_BOOL: {
       jvalue v;
       v.z = static_cast<jboolean>(JS_VALUE_GET_BOOL(val));
-      return env->CallStaticObjectMethodA(context->booleanClass, context->booleanValueOf, &v);
+      jobject boxed = env->CallStaticObjectMethodA(context->booleanClass, context->booleanValueOf, &v);
+      if (env->ExceptionCheck()) return nullptr;
+      return boxed;
     }
     case JS_TAG_STRING:
       return context->toJavaString(env, val);
@@ -521,7 +855,12 @@ __attribute__((used, visibility("default"))) jobject bridgeForAny(JNIEnv *env, J
         }
         return list;
       }
-      // 1) Try bridge_dispatch
+      // 1) Kotlin/JS collection (map/set/list): the guest identifies it and drives the iteration.
+      CollectionKind kind = bridgeCollectionKind(ctx, val);
+      if (kind != COLLECTION_KIND_NONE) {
+        return bridgeCollectionToJava(env, ctx, val, kind, bridgeForAny, bridgeForAny);
+      }
+      // 2) Try bridge_dispatch
       JSValue disp = JS_GetPropertyStr(ctx, val, "bridge_dispatch");
       BridgeConverterFn d = bridgeConverterFromJSValue(disp);
       JS_FreeValue(ctx, disp);
@@ -529,15 +868,389 @@ __attribute__((used, visibility("default"))) jobject bridgeForAny(JNIEnv *env, J
         result = d(env, ctx, val);
         if (result) return result;
       }
-      // 2) Try Kotlin/JS Long
+      // 3) Try Kotlin/JS Long
       result = bridgeTryUnwrapLong(env, ctx, val);
       if (result) return result;
+      // 3) No converter: a class instance that cannot be decoded. Returning null here used to
+      // surface as a confusing cast/NPE far from the cause (e.g. a List<TopBarIcon> arriving as
+      // [null] because TopBarIcon was not annotated), so name the class instead.
+      throwUnbridgedJsObject(env, ctx, val);
       return nullptr;
     }
 
     default:
       return nullptr;
   }
+}
+
+// Convert a Map key: boxed primitives and String become raw JS values (matching the shapes
+// JS-created maps hold); anything else is stringified via toString(), matching Kotlin/JS
+// property-key coercion. Never fails (no JS value creation failure path).
+static JSValue boxedKeyToJs(JNIEnv* env, JSContext* ctx, jobject key) {
+  auto* context = reinterpret_cast<Context*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+  if (key == nullptr) return JS_NULL;
+  if (env->IsInstanceOf(key, context->stringClass)) {
+    return context->toJsString(env, static_cast<jstring>(key));
+  }
+  if (env->IsInstanceOf(key, context->integerClass)) {
+    jvalue v;
+    v.i = env->CallIntMethod(key, context->integerIntValue);
+    return JS_NewInt32(ctx, v.i);
+  }
+  if (env->IsInstanceOf(key, context->longClass)) {
+    jvalue v;
+    v.j = env->CallLongMethod(key, context->longLongValue);
+    return JS_NewInt64(ctx, v.j);
+  }
+  if (env->IsInstanceOf(key, context->doubleClass)) {
+    jvalue v;
+    v.d = env->CallDoubleMethod(key, context->doubleDoubleValue);
+    return JS_NewFloat64(ctx, v.d);
+  }
+  if (env->IsInstanceOf(key, context->floatClass)) {
+    jvalue v;
+    v.f = env->CallFloatMethod(key, context->floatFloatValue);
+    return JS_NewFloat64(ctx, (double)v.f);
+  }
+  if (env->IsInstanceOf(key, context->booleanClass)) {
+    jvalue v;
+    v.z = env->CallBooleanMethod(key, context->booleanBooleanValue);
+    return JS_NewBool(ctx, v.z);
+  }
+  if (env->IsInstanceOf(key, context->shortClass)) {
+    jvalue v;
+    v.s = env->CallShortMethod(key, context->shortShortValue);
+    return JS_NewInt32(ctx, (int32_t)v.s);
+  }
+  if (env->IsInstanceOf(key, context->byteClass)) {
+    jvalue v;
+    v.b = env->CallByteMethod(key, context->byteByteValue);
+    return JS_NewInt32(ctx, (int32_t)v.b);
+  }
+  if (env->IsInstanceOf(key, context->characterClass)) {
+    jvalue v;
+    v.c = env->CallCharMethod(key, context->characterCharValue);
+    return JS_NewInt32(ctx, (int32_t)v.c);
+  }
+  jstring str = static_cast<jstring>(env->CallObjectMethod(key, context->objectToString));
+  JSValue result = context->toJsString(env, str);
+  env->DeleteLocalRef(str);
+  return result;
+}
+
+__attribute__((used, visibility("default"))) JSValue bridgeNewJsObject(JNIEnv* env, JSContext *ctx, const char* fq) {
+  auto* context = reinterpret_cast<Context*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+  if (!context) {
+    env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),
+                  "host2js: cannot create a bridge object: the JS runtime has no Context");
+    return JS_UNDEFINED;
+  }
+  auto it = context->bridgeProtos.find(fq);
+  if (it == context->bridgeProtos.end()) {
+    // Crash here, never hand back a JS sentinel: `undefined` is a valid JS value, so a caller
+    // that skipped the check would silently ship a payload field of undefined.
+    std::string message = "host2js: no registered prototype for " + std::string(fq) +
+                          "; the guest module did not call __bridgeRegister for this class";
+    env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), message.c_str());
+    return JS_UNDEFINED;
+  }
+  // New instance whose prototype is the existing stored prototype. No dup/free of the stored
+  // proto: the new object's shape holds its own reference and the map keeps its own.
+  JSValue result = JS_NewObjectProto(ctx, it->second);
+  if (JS_IsException(result)) {
+    // Drop the pending JS exception: the Java exception below is the one that propagates.
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    std::string message = "host2js: failed to allocate a JS object for " + std::string(fq);
+    env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), message.c_str());
+    return JS_UNDEFINED;
+  }
+  return result;
+}
+
+__attribute__((used, visibility("default"))) JSValue bridgeLongToJs(JNIEnv* env, JSContext* ctx, jlong value) {
+  auto* context = reinterpret_cast<Context*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+  if (JS_IsUndefined(context->bridgeNewLong)) {
+    env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),
+                  "host2js: no registered newLong runtime factory; the guest module did not call __bridgeRegisterRuntime");
+    return JS_NULL;
+  }
+  JSValue low = JS_NewInt32(ctx, (int32_t)value);
+  JSValue high = JS_NewInt32(ctx, (int32_t)(value >> 32));
+  JSValue args[2] = {low, high};
+  JSValue r = JS_Call(ctx, context->bridgeNewLong, JS_UNDEFINED, 2, args);
+  JS_FreeValue(ctx, low);
+  JS_FreeValue(ctx, high);
+  return r; // JS_EXCEPTION (factory threw) propagates; caller frees.
+}
+
+__attribute__((used, visibility("default"))) JSValue bridgeAnyToJs(JNIEnv* env, JSContext* ctx, jobject obj) {
+  auto* context = reinterpret_cast<Context*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+  if (obj == nullptr) return JS_NULL;
+
+  if (env->IsInstanceOf(obj, context->integerClass)) {
+    jvalue v;
+    v.i = env->CallIntMethod(obj, context->integerIntValue);
+    return JS_NewInt32(ctx, v.i);
+  }
+  if (env->IsInstanceOf(obj, context->longClass)) {
+    jvalue v;
+    v.j = env->CallLongMethod(obj, context->longLongValue);
+    if (env->ExceptionCheck()) return JS_NULL;
+    return bridgeLongToJs(env, ctx, v.j);
+  }
+  if (env->IsInstanceOf(obj, context->doubleClass)) {
+    jvalue v;
+    v.d = env->CallDoubleMethod(obj, context->doubleDoubleValue);
+    return JS_NewFloat64(ctx, v.d);
+  }
+  if (env->IsInstanceOf(obj, context->floatClass)) {
+    jvalue v;
+    v.f = env->CallFloatMethod(obj, context->floatFloatValue);
+    return JS_NewFloat64(ctx, (double)v.f);
+  }
+  if (env->IsInstanceOf(obj, context->booleanClass)) {
+    jvalue v;
+    v.z = env->CallBooleanMethod(obj, context->booleanBooleanValue);
+    return JS_NewBool(ctx, v.z);
+  }
+  if (env->IsInstanceOf(obj, context->shortClass)) {
+    jvalue v;
+    v.s = env->CallShortMethod(obj, context->shortShortValue);
+    return JS_NewInt32(ctx, (int32_t)v.s);
+  }
+  if (env->IsInstanceOf(obj, context->byteClass)) {
+    jvalue v;
+    v.b = env->CallByteMethod(obj, context->byteByteValue);
+    return JS_NewInt32(ctx, (int32_t)v.b);
+  }
+  if (env->IsInstanceOf(obj, context->characterClass)) {
+    jvalue v;
+    v.c = env->CallCharMethod(obj, context->characterCharValue);
+    return JS_NewInt32(ctx, (int32_t)v.c);
+  }
+  if (env->IsInstanceOf(obj, context->stringClass)) {
+    return context->toJsString(env, static_cast<jstring>(obj));
+  }
+
+  if (env->IsInstanceOf(obj, context->listClass)) {
+    jint size = env->CallIntMethod(obj, context->listSize);
+    if (env->ExceptionCheck()) return JS_NULL;
+    JSValue arr = JS_NewArray(ctx);
+    for (jint i = 0; i < size && !env->ExceptionCheck(); i++) {
+      jobject element = env->CallObjectMethod(obj, context->listGet, i);
+      if (env->ExceptionCheck()) {
+        if (element) env->DeleteLocalRef(element);
+        break;
+      }
+      JSValue elementJs = bridgeAnyToJs(env, ctx, element);
+      if (element) env->DeleteLocalRef(element);
+      if (env->ExceptionCheck()) {
+        // Unbridgeable element: pending exception propagates; free the partial array.
+        JS_FreeValue(ctx, arr);
+        return JS_NULL;
+      }
+      JS_SetPropertyUint32(ctx, arr, (uint32_t)i, elementJs);
+    }
+    if (env->ExceptionCheck()) {
+      JS_FreeValue(ctx, arr);
+      return JS_NULL;
+    }
+    if (JS_IsUndefined(context->bridgeNewArrayList)) {
+      env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),
+                    "host2js: no registered newArrayList runtime factory; the guest module did not call __bridgeRegisterRuntime");
+      JS_FreeValue(ctx, arr);
+      return JS_NULL;
+    }
+    JSValue args[1] = {arr};
+    JSValue r = JS_Call(ctx, context->bridgeNewArrayList, JS_UNDEFINED, 1, args);
+    if (JS_IsException(r)) {
+      JSValue e = JS_GetException(ctx);
+      const char* es = JS_ToCString(ctx, e);
+        if (es != NULL) JS_FreeCString(ctx, es);
+      JS_FreeValue(ctx, e);
+      JS_FreeValue(ctx, r);
+      r = JS_NULL;
+    }
+    JS_FreeValue(ctx, arr);
+    return r;
+  }
+
+  if (env->IsInstanceOf(obj, context->mapClass)) {
+    jobject entrySet = env->CallObjectMethod(obj, context->mapEntrySet);
+    if (env->ExceptionCheck()) return JS_NULL;
+    if (entrySet == nullptr) return JS_NULL;
+    jobject iterator = env->CallObjectMethod(entrySet, context->setIterator);
+    env->DeleteLocalRef(entrySet);
+    if (env->ExceptionCheck()) return JS_NULL;
+    if (iterator == nullptr) return JS_NULL;
+    // Two parallel JS arrays: the guest's newLinkedHashMap factory zips them into pairs and
+    // builds a real LinkedHashMap (no internal-layout reliance, matches JS-created maps).
+    JSValue keys = JS_NewArray(ctx);
+    JSValue values = JS_NewArray(ctx);
+    jint index = 0;
+    while (!env->ExceptionCheck()) {
+      jboolean hasNext = env->CallBooleanMethod(iterator, context->iteratorHasNext);
+      if (env->ExceptionCheck()) break;
+      if (!hasNext) break;
+      jobject entry = env->CallObjectMethod(iterator, context->iteratorNext);
+      if (env->ExceptionCheck()) break;
+      if (entry == nullptr) break;
+      jobject key = env->CallObjectMethod(entry, context->entryGetKey);
+      jobject value = env->CallObjectMethod(entry, context->entryGetValue);
+      if (env->ExceptionCheck()) {
+        env->DeleteLocalRef(entry);
+        if (key) env->DeleteLocalRef(key);
+        if (value) env->DeleteLocalRef(value);
+        break;
+      }
+      JSValue keyJs = boxedKeyToJs(env, ctx, key);
+      JSValue valueJs = bridgeAnyToJs(env, ctx, value);
+      if (key) env->DeleteLocalRef(key);
+      if (value) env->DeleteLocalRef(value);
+      env->DeleteLocalRef(entry);
+      if (env->ExceptionCheck()) {
+        JS_FreeValue(ctx, keyJs);
+        JS_FreeValue(ctx, keys);
+        JS_FreeValue(ctx, values);
+        env->DeleteLocalRef(iterator);
+        return JS_NULL;
+      }
+      JS_SetPropertyUint32(ctx, keys, (uint32_t)index, keyJs);
+      JS_SetPropertyUint32(ctx, values, (uint32_t)index, valueJs);
+      index++;
+    }
+    env->DeleteLocalRef(iterator);
+    if (env->ExceptionCheck()) {
+      JS_FreeValue(ctx, keys);
+      JS_FreeValue(ctx, values);
+      return JS_NULL;
+    }
+    if (JS_IsUndefined(context->bridgeNewLinkedHashMap)) {
+      env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),
+                    "host2js: no registered newLinkedHashMap runtime factory; the guest module did not call __bridgeRegisterRuntime");
+      JS_FreeValue(ctx, keys);
+      JS_FreeValue(ctx, values);
+      return JS_NULL;
+    }
+    JSValue args[2] = {keys, values};
+    JSValue r = JS_Call(ctx, context->bridgeNewLinkedHashMap, JS_UNDEFINED, 2, args);
+    JS_FreeValue(ctx, keys);
+    JS_FreeValue(ctx, values);
+    return r;
+  }
+
+  // Arrays (primitive and reference). JNI has no IsArray. Every reference array is a subtype of
+  // Object[] and each primitive array has its own class, so these checks ARE the array test.
+  // java/lang/Cloneable is not: ArrayList, HashMap and most of the JDK implement it, and reading
+  // one of those with GetArrayLength is undefined behaviour.
+  jclass objClass = env->GetObjectClass(obj);
+  bool isArray = env->IsInstanceOf(obj, Context::intArrayClass)
+      || env->IsInstanceOf(obj, Context::longArrayClass)
+      || env->IsInstanceOf(obj, Context::doubleArrayClass)
+      || env->IsInstanceOf(obj, Context::floatArrayClass)
+      || env->IsInstanceOf(obj, Context::booleanArrayClass)
+      || env->IsInstanceOf(obj, Context::shortArrayClass)
+      || env->IsInstanceOf(obj, Context::byteArrayClass)
+      || env->IsInstanceOf(obj, Context::characterArrayClass)
+      || env->IsInstanceOf(obj, Context::objectArrayClass);
+  if (isArray) {
+    env->DeleteLocalRef(objClass);
+    jsize length = env->GetArrayLength(static_cast<jarray>(obj));
+    JSValue arr = JS_NewArray(ctx);
+    if (env->IsInstanceOf(obj, Context::intArrayClass)) {
+      jintArray typed = static_cast<jintArray>(obj);
+      jint* elements = env->GetIntArrayElements(typed, nullptr);
+      for (jsize i = 0; i < length; i++) {
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewInt32(ctx, elements[i]));
+      }
+      env->ReleaseIntArrayElements(typed, elements, JNI_ABORT);
+    } else if (env->IsInstanceOf(obj, Context::longArrayClass)) {
+      jlongArray typed = static_cast<jlongArray>(obj);
+      jlong* elements = env->GetLongArrayElements(typed, nullptr);
+      for (jsize i = 0; i < length; i++) {
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewInt64(ctx, elements[i]));
+      }
+      env->ReleaseLongArrayElements(typed, elements, JNI_ABORT);
+    } else if (env->IsInstanceOf(obj, Context::doubleArrayClass)) {
+      jdoubleArray typed = static_cast<jdoubleArray>(obj);
+      jdouble* elements = env->GetDoubleArrayElements(typed, nullptr);
+      for (jsize i = 0; i < length; i++) {
+        // JS_NewFloat64 canonicalizes int32-sized integral values to JS_TAG_INT; the JS->host
+        // readers dispatch on the tag, so either encoding round-trips.
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewFloat64(ctx, elements[i]));
+      }
+      env->ReleaseDoubleArrayElements(typed, elements, JNI_ABORT);
+    } else if (env->IsInstanceOf(obj, Context::floatArrayClass)) {
+      jfloatArray typed = static_cast<jfloatArray>(obj);
+      jfloat* elements = env->GetFloatArrayElements(typed, nullptr);
+      for (jsize i = 0; i < length; i++) {
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewFloat64(ctx, (double)elements[i]));
+      }
+      env->ReleaseFloatArrayElements(typed, elements, JNI_ABORT);
+    } else if (env->IsInstanceOf(obj, Context::booleanArrayClass)) {
+      jbooleanArray typed = static_cast<jbooleanArray>(obj);
+      jboolean* elements = env->GetBooleanArrayElements(typed, nullptr);
+      for (jsize i = 0; i < length; i++) {
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewBool(ctx, elements[i]));
+      }
+      env->ReleaseBooleanArrayElements(typed, elements, JNI_ABORT);
+    } else if (env->IsInstanceOf(obj, Context::shortArrayClass)) {
+      jshortArray typed = static_cast<jshortArray>(obj);
+      jshort* elements = env->GetShortArrayElements(typed, nullptr);
+      for (jsize i = 0; i < length; i++) {
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewInt32(ctx, (int32_t)elements[i]));
+      }
+      env->ReleaseShortArrayElements(typed, elements, JNI_ABORT);
+    } else if (env->IsInstanceOf(obj, Context::byteArrayClass)) {
+      jbyteArray typed = static_cast<jbyteArray>(obj);
+      jbyte* elements = env->GetByteArrayElements(typed, nullptr);
+      for (jsize i = 0; i < length; i++) {
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewInt32(ctx, (int32_t)elements[i]));
+      }
+      env->ReleaseByteArrayElements(typed, elements, JNI_ABORT);
+    } else if (env->IsInstanceOf(obj, Context::characterArrayClass)) {
+      jcharArray typed = static_cast<jcharArray>(obj);
+      jchar* elements = env->GetCharArrayElements(typed, nullptr);
+      for (jsize i = 0; i < length; i++) {
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewInt32(ctx, (int32_t)elements[i]));
+      }
+      env->ReleaseCharArrayElements(typed, elements, JNI_ABORT);
+    } else if (env->IsInstanceOf(obj, Context::objectArrayClass)) {
+      // Reference array (String[], Object[], annotated-element arrays...): convert each
+      // element recursively via bridgeAnyToJs.
+      jobjectArray typed = static_cast<jobjectArray>(obj);
+      for (jsize i = 0; i < length && !env->ExceptionCheck(); i++) {
+        jobject element = env->GetObjectArrayElement(typed, i);
+        JSValue elementJs = bridgeAnyToJs(env, ctx, element);
+        if (element) env->DeleteLocalRef(element);
+        if (env->ExceptionCheck()) {
+          JS_FreeValue(ctx, arr);
+          return JS_NULL;
+        }
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, elementJs);
+      }
+      if (env->ExceptionCheck()) {
+        JS_FreeValue(ctx, arr);
+        return JS_NULL;
+      }
+    }
+    return arr;
+  }
+
+  // Anything else: virtual dispatch to the annotated class's convertToJs(J)J member.
+  jmethodID convertToJs = env->GetMethodID(objClass, "convertToJs", "(J)J");
+  env->DeleteLocalRef(objClass);
+  if (env->ExceptionCheck()) {
+    // NoSuchMethodError (or other) from an unbridgeable object: leave it pending — it
+    // propagates to the JVM and crashes (per the error policy, never a silent null).
+    return JS_NULL;
+  }
+  jlong ret = env->CallLongMethod(obj, convertToJs, (jlong)ctx);
+  if (env->ExceptionCheck()) {
+    // A throwing convertToJs propagates the same way.
+    return JS_NULL;
+  }
+  return JS_MKPTR(JS_TAG_OBJECT, (void*)(intptr_t)ret);
 }
 
 jobject
@@ -559,6 +1272,7 @@ Context::toJavaObject(JNIEnv* env, const JSValueConst& value, bool throwOnUnsupp
       jvalue v;
       v.z = static_cast<jboolean>(JS_VALUE_GET_BOOL(value));
       result = env->CallStaticObjectMethodA(booleanClass, booleanValueOf, &v);
+      if (env->ExceptionCheck()) result = nullptr;
       break;
     }
 
@@ -566,6 +1280,7 @@ Context::toJavaObject(JNIEnv* env, const JSValueConst& value, bool throwOnUnsupp
       jvalue v;
       v.j = static_cast<jint>(JS_VALUE_GET_INT(value));
       result = env->CallStaticObjectMethodA(integerClass, integerValueOf, &v);
+      if (env->ExceptionCheck()) result = nullptr;
       break;
     }
 
@@ -573,6 +1288,7 @@ Context::toJavaObject(JNIEnv* env, const JSValueConst& value, bool throwOnUnsupp
       jvalue v;
       v.d = static_cast<jdouble>(JS_VALUE_GET_FLOAT64(value));
       result = env->CallStaticObjectMethodA(doubleClass, doubleValueOf, &v);
+      if (env->ExceptionCheck()) result = nullptr;
       break;
     }
 
@@ -597,6 +1313,17 @@ Context::toJavaObject(JNIEnv* env, const JSValueConst& value, bool throwOnUnsupp
           JS_FreeValue(jsContext, element);
         }
         break;
+      }
+      // Kotlin/JS collections (map/set/list) are objects, not JS arrays. The guest identifies them
+      // and drives iteration through the value ops: the same decode the untyped property path
+      // (bridgeForAny) uses. Without this a guest-authored collection decodes to null.
+      {
+        CollectionKind kind = bridgeCollectionKind(jsContext, value);
+        if (kind != COLLECTION_KIND_NONE) {
+          result = bridgeCollectionToJava(env, jsContext, value, kind, bridgeForAny, bridgeForAny);
+          if (env->ExceptionCheck()) return nullptr;
+          if (result != nullptr) return result;
+        }
       }
       // Try bridge_dispatch
       {
@@ -739,6 +1466,39 @@ void Context::ensureStatics(JNIEnv* env) {
     env->GetJavaVM(&javaVm);
     jniVersion = env->GetVersion();
 
+    // Kotlin/JS collection targets for the untyped decode path (bridgeCollectionToJava). Acquired
+    // here rather than in the RDMA setup: that path is used whether or not the RDMA channel is
+    // enabled, so it cannot depend on that channel's initialization.
+    if (arrayListClass == nullptr) {
+      jclass alCls = env->FindClass("java/util/ArrayList");
+      arrayListClass = static_cast<jclass>(env->NewGlobalRef(alCls));
+      arrayListInit = env->GetMethodID(alCls, "<init>", "()V");
+      arrayListInitWithCapacity = env->GetMethodID(alCls, "<init>", "(I)V");
+      arrayListAdd = env->GetMethodID(alCls, "add", "(Ljava/lang/Object;)Z");
+    }
+    if (linkedHashMapClass == nullptr) {
+      jclass lhmCls = env->FindClass("java/util/LinkedHashMap");
+      linkedHashMapClass = static_cast<jclass>(env->NewGlobalRef(lhmCls));
+      linkedHashMapInit = env->GetMethodID(lhmCls, "<init>", "()V");
+      mapPut = env->GetMethodID(lhmCls, "put",
+          "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+    }
+    if (linkedHashSetClass == nullptr) {
+      jclass lhsCls = env->FindClass("java/util/LinkedHashSet");
+      linkedHashSetClass = static_cast<jclass>(env->NewGlobalRef(lhsCls));
+      linkedHashSetInit = env->GetMethodID(lhsCls, "<init>", "()V");
+      setAdd = env->GetMethodID(lhsCls, "add", "(Ljava/lang/Object;)Z");
+    }
+
+    Context::objectArrayClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("[Ljava/lang/Object;")));
+    Context::intArrayClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("[I")));
+    Context::longArrayClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("[J")));
+    Context::doubleArrayClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("[D")));
+    Context::floatArrayClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("[F")));
+    Context::booleanArrayClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("[Z")));
+    Context::shortArrayClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("[S")));
+    Context::byteArrayClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("[B")));
+    Context::characterArrayClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("[C")));
     booleanClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/lang/Boolean")));
     integerClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/lang/Integer")));
     doubleClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/lang/Double")));
@@ -759,22 +1519,27 @@ void Context::ensureStatics(JNIEnv* env) {
     interruptHandlerClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("app/cash/zipline/InterruptHandler")));
     interruptHandlerPoll = env->GetMethodID(interruptHandlerClass, "poll", "()Z");
 
-    memoryUsageClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("app/cash/zipline/MemoryUsage")));
-    if (memoryUsageClass) {
+    jclass memoryUsageCls = env->FindClass("app/cash/zipline/MemoryUsage");
+    if (memoryUsageCls == nullptr) {
+      // MemoryUsage absent (e.g. R8-stripped): leave the cache null; memoryUsage() returns
+      // nullptr. The failed FindClass left a pending exception, and the JVM treats any JNI call
+      // made while one is pending as a fatal error: clear it before making another.
+      env->ExceptionClear();
+    } else {
+      memoryUsageClass = static_cast<jclass>(env->NewGlobalRef(memoryUsageCls));
       memoryUsageConstructor = env->GetMethodID(
           memoryUsageClass, "<init>", "(JJJJJJJJJJJJJJJJJJJJJJJJJJ)V");
-    } else {
-      // MemoryUsage absent (e.g. R8-stripped): leave the cache null; memoryUsage() returns
-      // nullptr. The failed FindClass left a pending exception — clear it so that session
-      // creation still succeeds.
-      env->ExceptionClear();
     }
 
     // RdmaBridge static JsonElement factories. A missing class means RDMA is unused: leave the
     // cache null and skip the factory lookups, matching the old per-session failure behavior.
     jclass bridgeCls = env->FindClass("app/cash/redwood/treehouse/RdmaBridge");
-    rdmaBridgeClass = static_cast<jclass>(env->NewGlobalRef(bridgeCls));
-    if (rdmaBridgeClass) {
+    if (bridgeCls == nullptr) {
+      // RdmaBridge absent (RDMA unused, e.g. a JVM host without the redwood dependency): the
+      // factory cache stays null. As above, clear the pending exception before the next JNI call.
+      env->ExceptionClear();
+    } else {
+      rdmaBridgeClass = static_cast<jclass>(env->NewGlobalRef(bridgeCls));
       rdmaBridgeJsonPrimitiveString = env->GetStaticMethodID(
           bridgeCls, "jsonPrimitiveString",
           "(Ljava/lang/String;)Lkotlinx/serialization/json/JsonPrimitive;");
@@ -794,18 +1559,6 @@ void Context::ensureStatics(JNIEnv* env) {
       rdmaBridgeCreateJsonObject = env->GetStaticMethodID(
           bridgeCls, "createJsonObject",
           "(Ljava/util/List;Ljava/util/List;)Lkotlinx/serialization/json/JsonObject;");
-
-      // ArrayList
-      jclass alCls = env->FindClass("java/util/ArrayList");
-      arrayListClass = static_cast<jclass>(env->NewGlobalRef(alCls));
-      arrayListInit = env->GetMethodID(alCls, "<init>", "()V");
-      arrayListInitWithCapacity = env->GetMethodID(alCls, "<init>", "(I)V");
-      arrayListAdd = env->GetMethodID(alCls, "add", "(Ljava/lang/Object;)Z");
-    } else {
-      // RdmaBridge absent (RDMA unused, e.g. a JVM host without the redwood dependency): the
-      // factory cache stays null. The failed FindClass left a pending exception — clear it so
-      // that session creation proceeds normally.
-      env->ExceptionClear();
     }
 
     // RdmaChangeSink interface method IDs
@@ -831,6 +1584,35 @@ void Context::ensureStatics(JNIEnv* env) {
     pairClass = static_cast<jclass>(env->NewGlobalRef(pairCls));
     pairInit = env->GetMethodID(pairCls, "<init>", "(Ljava/lang/Object;Ljava/lang/Object;)V");
     env->DeleteLocalRef(pairCls);
+
+    // host2js: boxed-primitive keys and java.util.List/Map iteration. These are JDK classes
+    // guaranteed on every supported JVM, so no absence guard (matching integerClass etc.).
+    floatClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/lang/Float")));
+    shortClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/lang/Short")));
+    byteClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/lang/Byte")));
+    characterClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/lang/Character")));
+    listClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/util/List")));
+    mapClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/util/Map")));
+    mapEntryClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/util/Map$Entry")));
+    setClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/util/Set")));
+    iteratorClass = static_cast<jclass>(env->NewGlobalRef(env->FindClass("java/util/Iterator")));
+    integerIntValue = env->GetMethodID(integerClass, "intValue", "()I");
+    longLongValue = env->GetMethodID(longClass, "longValue", "()J");
+    doubleDoubleValue = env->GetMethodID(doubleClass, "doubleValue", "()D");
+    floatFloatValue = env->GetMethodID(floatClass, "floatValue", "()F");
+    booleanBooleanValue = env->GetMethodID(booleanClass, "booleanValue", "()Z");
+    shortShortValue = env->GetMethodID(shortClass, "shortValue", "()S");
+    byteByteValue = env->GetMethodID(byteClass, "byteValue", "()B");
+    characterCharValue = env->GetMethodID(characterClass, "charValue", "()C");
+    objectToString = env->GetMethodID(objectClass, "toString", "()Ljava/lang/String;");
+    listSize = env->GetMethodID(listClass, "size", "()I");
+    listGet = env->GetMethodID(listClass, "get", "(I)Ljava/lang/Object;");
+    mapEntrySet = env->GetMethodID(mapClass, "entrySet", "()Ljava/util/Set;");
+    setIterator = env->GetMethodID(setClass, "iterator", "()Ljava/util/Iterator;");
+    iteratorHasNext = env->GetMethodID(iteratorClass, "hasNext", "()Z");
+    iteratorNext = env->GetMethodID(iteratorClass, "next", "()Ljava/lang/Object;");
+    entryGetKey = env->GetMethodID(mapEntryClass, "getKey", "()Ljava/lang/Object;");
+    entryGetValue = env->GetMethodID(mapEntryClass, "getValue", "()Ljava/lang/Object;");
   });
 }
 
@@ -1041,7 +1823,7 @@ void Context::dispatchChangeToSink(JNIEnv* env, const RdmaChange& ch) {
             dbgName ? dbgName : "(null)");
         abort();
 #endif
-        if (dbgName && dbgName != "(unknown)") JS_FreeCString(jsContext, dbgName);
+        if (dbgName && strcmp(dbgName, "(unknown)") != 0) JS_FreeCString(jsContext, dbgName);
         JS_FreeValue(jsContext, dbgCtor);
       }
       JS_FreeValue(jsContext, ch.jsValue);
@@ -1294,4 +2076,94 @@ void Context::initRdmaChangesChannel(JNIEnv* env, jobject rdmaChangeSink) {
       "app_cash_redwood_rdmaSendChanges", rdmaObj);
 
   JS_FreeValue(jsContext, global);
+}
+
+// -- Host→guest bridge call (direct events) --
+
+/** The offending argument's JVM class name for the QuickJsException message; error path only. */
+static std::string jniClassNameOf(JNIEnv* env, jobject obj) {
+  if (obj == nullptr) return "null";
+  jclass objClass = env->GetObjectClass(obj);
+  jclass classClass = env->FindClass("java/lang/Class");
+  jmethodID getName = env->GetMethodID(classClass, "getName", "()Ljava/lang/String;");
+  jstring nameStr = static_cast<jstring>(env->CallObjectMethod(objClass, getName));
+  const char* chars = nameStr ? env->GetStringUTFChars(nameStr, nullptr) : nullptr;
+  std::string result = chars ? chars : "<unknown>";
+  if (chars) env->ReleaseStringUTFChars(nameStr, chars);
+  if (nameStr) env->DeleteLocalRef(nameStr);
+  env->DeleteLocalRef(classClass);
+  env->DeleteLocalRef(objClass);
+  return result;
+}
+
+jboolean Context::hasGlobalFunction(JNIEnv* env, jstring name) {
+  std::string nameStr = toCppString(env, name);
+  JSValue global = JS_GetGlobalObject(jsContext);
+  JSValue fn = JS_GetPropertyStr(jsContext, global, nameStr.c_str());
+  jboolean result = JS_IsFunction(jsContext, fn) ? JNI_TRUE : JNI_FALSE;
+  JS_FreeValue(jsContext, fn);
+  JS_FreeValue(jsContext, global);
+  return result;
+}
+
+jobject Context::callGuestFunction(JNIEnv* env, jstring name, jobject argsList) {
+  std::string nameStr = toCppString(env, name);
+
+  // Resolve globalThis[name]; anything other than a callable is a loud error.
+  JSValue global = JS_GetGlobalObject(jsContext);
+  JSValue fn = JS_GetPropertyStr(jsContext, global, nameStr.c_str());
+  JS_FreeValue(jsContext, global);
+  if (!JS_IsFunction(jsContext, fn)) {
+    JS_FreeValue(jsContext, fn);
+    throwJavaException(env, "app/cash/zipline/QuickJsException",
+        "callGuestFunction: no callable function '%s' on globalThis", nameStr.c_str());
+    return nullptr;
+  }
+
+  const jint argc = env->CallIntMethod(argsList, listSize);
+  if (env->ExceptionCheck()) {
+    JS_FreeValue(jsContext, fn);
+    return nullptr;
+  }
+
+  // Convert each argument host→JS via the @WithHost2JSBridge machinery. A failing conversion
+  // (unregistered/unannotated class) throws loudly with the offending class; no fallback.
+  std::vector<JSValue> argv;
+  argv.reserve(static_cast<size_t>(argc));
+  for (jint i = 0; i < argc; i++) {
+    jobject element = env->CallObjectMethod(argsList, listGet, i);
+    if (env->ExceptionCheck()) {
+      for (auto& v : argv) JS_FreeValue(jsContext, v);
+      JS_FreeValue(jsContext, fn);
+      return nullptr;
+    }
+    JSValue elementJs = bridgeAnyToJs(env, jsContext, element);
+    if (env->ExceptionCheck()) {
+      // bridgeAnyToJs leaves the raw pending exception; clear it and rethrow a
+      // QuickJsException naming the offending argument class. (ExceptionClear must come
+      // before any further JNI calls.)
+      env->ExceptionClear();
+      std::string cls = jniClassNameOf(env, element);
+      if (element) env->DeleteLocalRef(element);
+      for (auto& v : argv) JS_FreeValue(jsContext, v);
+      JS_FreeValue(jsContext, fn);
+      throwJavaException(env, "app/cash/zipline/QuickJsException",
+          "callGuestFunction: cannot convert argument %d of class %s to JS", i, cls.c_str());
+      return nullptr;
+    }
+    if (element) env->DeleteLocalRef(element);
+    argv.push_back(elementJs);
+  }
+
+  JSValue result = JS_Call(jsContext, fn, JS_UNDEFINED, argc, argv.empty() ? nullptr : argv.data());
+  for (auto& v : argv) JS_FreeValue(jsContext, v);
+  JS_FreeValue(jsContext, fn);
+  if (JS_IsException(result)) {
+    throwJsException(env, result);
+    JS_FreeValue(jsContext, result);
+    return nullptr;
+  }
+  jobject javaResult = bridgeForAny(env, jsContext, result);
+  JS_FreeValue(jsContext, result);
+  return javaResult;
 }

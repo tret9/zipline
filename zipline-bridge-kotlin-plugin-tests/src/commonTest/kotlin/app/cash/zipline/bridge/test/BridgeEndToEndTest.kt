@@ -85,6 +85,14 @@ class BridgeEndToEndTest {
   }
 
   @Test
+  fun bridgedCallbackHolder() {
+    // The function field decodes to null; the rest of the object must survive the round trip.
+    val decoded = evalOne("provideBridgedCallbackHolder") as BridgedCallbackHolder
+    assertEquals("done", decoded.name)
+    assertEquals(null, decoded.onDone)
+  }
+
+  @Test
   fun bridgedFloatListHolder() {
     // Integral Float values (0f/1f) are stored as INT-tagged JS numbers and must be
     // converted to Float, not read through the float64 slot (regression for
