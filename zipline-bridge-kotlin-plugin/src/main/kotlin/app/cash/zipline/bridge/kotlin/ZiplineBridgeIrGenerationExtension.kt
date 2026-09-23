@@ -3,12 +3,15 @@ package app.cash.zipline.bridge.kotlin
 import org.jetbrains.kotlin.backend.common.extensions.DeclarationFinder
 import org.jetbrains.kotlin.backend.common.extensions.IrGenerationExtension
 import org.jetbrains.kotlin.backend.common.extensions.IrPluginContext
+import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
+import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.descriptors.ClassKind
 import org.jetbrains.kotlin.ir.declarations.IrClass
 import org.jetbrains.kotlin.ir.declarations.IrConstructor
 import org.jetbrains.kotlin.ir.declarations.IrModuleFragment
 import org.jetbrains.kotlin.ir.types.getClass
 import org.jetbrains.kotlin.ir.util.classId
+import org.jetbrains.kotlin.ir.util.fqNameWhenAvailable
 import org.jetbrains.kotlin.ir.util.hasAnnotation
 import org.jetbrains.kotlin.ir.util.properties
 import org.jetbrains.kotlin.name.ClassId
@@ -18,6 +21,16 @@ import org.jetbrains.kotlin.name.Name
 internal val WITH_JS2HOST_BRIDGE_CLASS_ID = ClassId(
   FqName("app.cash.zipline.bridge.support"),
   Name.identifier("WithJS2HostBridge"),
+)
+
+internal val WITH_HOST2JS_BRIDGE_CLASS_ID = ClassId(
+  FqName("app.cash.zipline.bridge.support"),
+  Name.identifier("WithHost2JSBridge"),
+)
+
+internal val HOST_NAME_CLASS_ID = ClassId(
+  FqName("app.cash.zipline.bridge.support"),
+  Name.identifier("HostName"),
 )
 
 class ZiplineBridgeIrGenerationExtension(
@@ -31,7 +44,14 @@ class ZiplineBridgeIrGenerationExtension(
     finder.findClass(WITH_JS2HOST_BRIDGE_CLASS_ID) ?: return
 
     val annotatedClasses = findAnnotatedClasses(moduleFragment)
-    if (annotatedClasses.isEmpty()) return
+
+    // Host2JS classes (both-annotated included): same abstract/sealed/interface filter.
+    val host2JsClasses = findHost2JsAnnotatedClasses(moduleFragment).filter {
+      it.modality != org.jetbrains.kotlin.descriptors.Modality.ABSTRACT &&
+      it.modality != org.jetbrains.kotlin.descriptors.Modality.SEALED &&
+      it.kind != ClassKind.INTERFACE
+    }
+    if (annotatedClasses.isEmpty() && host2JsClasses.isEmpty()) return
 
     // Include all annotated classes except abstract/sealed (no JS constructor to export)
     val dispatchClasses = annotatedClasses.filter {
@@ -40,23 +60,51 @@ class ZiplineBridgeIrGenerationExtension(
       it.kind != ClassKind.INTERFACE
     }
 
+    // -- @HostName validation (a bad alias would silently break one side of a mixed deployment) --
+    validateHostNames(
+      (dispatchClasses + host2JsClasses).distinct(),
+      pluginContext.messageCollector,
+    )
+
     // -- @JsName annotations (stable JS property names for all bridge backends) --
     annotateJsNames(finder, dispatchClasses, pluginContext)
 
     // -- Kotlin/Native bridge generation (iOS) --
     if (nativeOutputDir != null) {
-      generateNativeBridges(nativeOutputDir, dispatchClasses)
+      generateNativeBridges(nativeOutputDir, dispatchClasses, pluginContext.messageCollector)
     }
 
     // -- C/JNI bridge generation (Android) --
     if (cOutputDir != null) {
-      generateCBridges(cOutputDir, annotatedClasses)
+      generateCBridges(cOutputDir, annotatedClasses, host2JsClasses)
       generateKeepNames(cOutputDir, annotatedClasses)
+      // JVM member injection: the external convertToJs(J)J native method, implemented by the
+      // generated C. Injected with the C generation so the member and its implementation exist
+      // together.
+      injectJvmConvertToJsMembers(pluginContext, host2JsClasses)
+    }
+
+    // -- Kotlin/Native host2js member injection (override + Host2JsConvertible supertype) --
+    if (pluginContext.platform?.componentPlatforms?.any { it is org.jetbrains.kotlin.platform.NativePlatform } == true) {
+      injectNativeConvertToJsMembers(finder, pluginContext, host2JsClasses)
     }
 
     // -- JS bridge dispatch injection (Kotlin/JS) --
     if (isJsTarget) {
-      injectCompanionInitBlocks(finder, moduleFragment, dispatchClasses, pluginContext)
+      // JS2Host-only classes keep the companion __bridgeRegister injection.
+      injectCompanionInitBlocks(
+        finder, moduleFragment,
+        dispatchClasses.filterNot { it in host2JsClasses },
+        pluginContext,
+      )
+      // Host2JS classes register at module load (prototypes + runtime factories), so the host
+      // can build payload objects for classes the guest never constructs. Modules with only
+      // JS2Host classes still need the value ops: their collections/Longs/enums reach the host
+      // through the same untyped path.
+      injectModuleLoadBridgeRegistration(
+        finder, pluginContext, moduleFragment, host2JsClasses,
+        js2HostOnlyClasses = dispatchClasses.filterNot { it in host2JsClasses },
+      )
     }
   }
 
@@ -90,6 +138,63 @@ internal val JS_NAME_CLASS_ID = ClassId(
   FqName("kotlin.js"),
   Name.identifier("JsName"),
 )
+
+/**
+ * Reject the `@HostName` declarations an alias cannot honour. Reported as errors, so the build
+ * fails through the normal message path rather than shipping a bridge that silently reads the
+ * wrong name on one side of a mixed deployment.
+ *
+ * A property whose `@HostName` value equals its own name is left alone: it installs nothing and
+ * reads nothing new.
+ */
+private fun validateHostNames(classes: List<IrClass>, messageCollector: MessageCollector) {
+  for (clazz in classes) {
+    val owner = clazz.fqNameWhenAvailable
+    /** Alias already taken in this class, to the property that claimed it. */
+    val claimedAliases = mutableMapOf<String, String>()
+    for (property in clazz.properties) {
+      // hostNameRaw, not hostName: only it keeps the empty string one of these messages is about.
+      val raw = hostNameRaw(property) ?: continue
+      val name = property.name.asString()
+      if (raw.isEmpty()) {
+        messageCollector.report(
+          CompilerMessageSeverity.ERROR,
+          "@HostName(\"\") on $owner.$name: the old name must not be empty",
+        )
+        continue
+      }
+      if (isInlineClass(clazz)) {
+        // Its JS shape is a box/mangled `_1` field the plugin does not control, so an alias there
+        // would not reach the reader on either side.
+        messageCollector.report(
+          CompilerMessageSeverity.ERROR,
+          "@HostName on $owner.$name: inline value class fields cannot carry a name alias",
+        )
+        continue
+      }
+      val alias = property.jsName(raw)
+      // The annotated name is the property's own current name: nothing to alias.
+      if (alias == property.jsName()) continue
+      val shadowed = clazz.properties
+        .firstOrNull { it != property && it.jsName() == alias }
+        ?.name?.asString()
+      if (shadowed != null) {
+        messageCollector.report(
+          CompilerMessageSeverity.ERROR,
+          "@HostName on $owner.$name: '$alias' is the current JS name of $shadowed",
+        )
+        continue
+      }
+      val other = claimedAliases.put(alias, name)
+      if (other != null) {
+        messageCollector.report(
+          CompilerMessageSeverity.ERROR,
+          "@HostName collision in $owner: '$alias' is claimed by both $other and $name",
+        )
+      }
+    }
+  }
+}
 
 /** Reads the optional [WithJS2HostBridge.targetFqn] from a class annotation. */
 internal fun resolveTargetFqn(irClass: IrClass): String? {

@@ -92,13 +92,21 @@ kotlin {
     val commonTest by getting {
       dependencies {
         implementation(kotlin("test"))
-        implementation(projects.ziplineLoader)
       }
       kotlin.srcDir(generatedGuestDir)
     }
     val jvmTest by getting {
       dependencies {
         implementation(kotlin("test-junit"))
+        // decodeGuestModule parses the embedded ZiplineFile container, which is host-only: the
+        // loader has no JS target, so this must not sit in commonTest (jsTest cannot resolve it).
+        implementation(projects.ziplineLoader)
+      }
+    }
+    val nativeTest by getting {
+      dependencies {
+        // Same as jvmTest: the native host parses the ZiplineFile container too.
+        implementation(projects.ziplineLoader)
       }
     }
   }
@@ -156,6 +164,9 @@ tasks {
   // Embed the guest bytecode as base64 constants, shared by jvmTest and nativeTest.
   val generateGuestSource = register("generateGuestSource") {
     dependsOn(compileGuestJs)
+    // The bytecode is this task's real input. Without it Gradle sees an unchanged output dir and
+    // keeps a stale holder after any guest change, so the tests silently run the old bundle.
+    inputs.dir(layout.buildDirectory.dir("zipline-guest"))
     outputs.dir(generatedGuestDir)
     doLast {
       val ziplineDir = layout.buildDirectory.dir("zipline-guest").get().asFile
@@ -185,6 +196,10 @@ tasks {
   val compileBridgeC = register<Exec>("compileBridgeC") {
     dependsOn("compileKotlinJvm")
     inputs.dir(bridgeCOutputDir)
+    // The generated C includes the shared dispatch header, and the C compiler reads it at build
+    // time. Without it as an input Gradle sees the generated sources unchanged and skips this
+    // task, leaving objects compiled against an older header.
+    inputs.file(rootProject.projectDir.resolve("zipline/native/bridge_dispatch.h"))
     outputs.dir(bridgeObjDir)
     doFirst {
       // The Gradle daemon may run on a JRE without JNI headers (e.g. Android Studio's JBR),
