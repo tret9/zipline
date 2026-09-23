@@ -50,6 +50,23 @@ class BridgeEndToEndTest {
   }
 
   @Test
+  fun guestListsDecode() {
+    assertEquals(listOf("a", "b"), evalOne("provideGuestList"))
+    assertEquals(listOf("only"), evalOne("provideGuestSingletonList"))
+    assertEquals(emptyList<String>(), evalOne("provideGuestEmptyList"))
+  }
+
+  @Test
+  fun guestMapDecodes() {
+    assertEquals(mapOf("a" to "1", "b" to "2"), evalOne("provideGuestMap"))
+  }
+
+  @Test
+  fun guestUnitDoesNotTripTheLoudGuard() {
+    evalOne("provideUnit")
+  }
+
+  @Test
   fun bridgedData() {
     assertEquals(BridgedTestValues.data, evalOne("provideBridgedData"))
   }

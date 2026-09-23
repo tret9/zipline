@@ -30,6 +30,25 @@ import org.jetbrains.kotlin.ir.util.fqNameWhenAvailable
 import org.jetbrains.kotlin.name.CallableId
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.name.Name
+import org.jetbrains.kotlin.backend.common.extensions.DeclarationFinder
+import org.jetbrains.kotlin.ir.builders.IrBuilderWithScope
+import org.jetbrains.kotlin.ir.builders.declarations.IrValueParameterBuilder
+import org.jetbrains.kotlin.ir.builders.declarations.buildValueParameter
+import org.jetbrains.kotlin.ir.builders.irBlock
+import org.jetbrains.kotlin.ir.builders.irBoolean
+import org.jetbrains.kotlin.ir.builders.irExprBody
+import org.jetbrains.kotlin.ir.builders.irGet
+import org.jetbrains.kotlin.ir.builders.irGetField
+import org.jetbrains.kotlin.ir.builders.irGetObjectValue
+import org.jetbrains.kotlin.ir.builders.irNull
+import org.jetbrains.kotlin.ir.builders.irReturn
+import org.jetbrains.kotlin.ir.expressions.IrExpression
+import org.jetbrains.kotlin.ir.expressions.impl.IrFunctionReferenceImpl
+import org.jetbrains.kotlin.ir.expressions.impl.IrGetFieldImpl
+import org.jetbrains.kotlin.ir.types.classOrNull
+import org.jetbrains.kotlin.ir.types.typeWith
+import org.jetbrains.kotlin.ir.util.createDispatchReceiverParameter
+import org.jetbrains.kotlin.name.ClassId
 
 // -- JS IR transformations (bridge_dispatch injection) --
 
@@ -53,6 +72,21 @@ internal fun injectCompanionInitBlocks(
         firstParam.type.getClass()?.classId?.asSingleFqName()?.asString() == "kotlin.reflect.KClass"
     } ?: error("KClass.js property getter not found")
   val kclassJsGetterSymbol = kclassJsGetterFn.symbol
+
+  // Prefer zipline's tolerant helper: it no-ops when no host installed `__bridgeRegister` (a bare
+  // Kotlin/JS runtime — a unit test, or any plain JS consumer of a bridged module — has nothing to
+  // register with), where the raw external below would throw at class-initialization time for every
+  // bridged class the runtime touches. See app.cash.zipline.registerBridge.
+  val tolerantRegisterSymbol = finder.findFunctions(
+    CallableId(FqName("app.cash.zipline"), Name.identifier("registerBridge")),
+  ).firstOrNull()
+
+  // Publish the guest's value ops (collections, Longs, enums) as soon as a bridged class registers:
+  // the host reads every one of those values through them, and it needs them before the application
+  // produces any. See app.cash.zipline.BridgeValueOps.
+  val valueOpsSymbol = finder.findFunctions(
+    CallableId(FqName("app.cash.zipline"), Name.identifier("publishValueOps")),
+  ).firstOrNull()
 
   // Generate @JsName("__bridgeRegister") external fun __bridgeRegister(fqn: String, ctor: Any?)
   // once in the module. Companion constructors call this directly — no bridgeSelfRegister wrapper.
@@ -92,16 +126,18 @@ internal fun injectCompanionInitBlocks(
     }
     fileForModule.declarations += bridgeRegisterFn
   }
-  val bridgeRegisterSymbol = bridgeRegisterFn.symbol
+  val bridgeRegisterSymbol = tolerantRegisterSymbol ?: bridgeRegisterFn.symbol
 
-  for (clazz in dispatchClasses) {
+  for ((index, clazz) in dispatchClasses.withIndex()) {
     val ownFqn = clazz.fqNameWhenAvailable?.asString() ?: continue
     val targetFqn = resolveTargetFqn(clazz) ?: ownFqn
+    // Once per module is enough; the ops live on globalThis for the runtime's whole lifetime.
+    val opsCall = if (index == 0) valueOpsSymbol else null
 
     if (clazz.isCompanion || clazz.kind == ClassKind.OBJECT) {
       injectBridgeIntoConstructor(
         clazz, targetFqn, clazz,
-        kclassJsGetterSymbol, bridgeRegisterSymbol, pluginContext,
+        kclassJsGetterSymbol, bridgeRegisterSymbol, pluginContext, opsCall,
       )
       continue
     }
@@ -114,7 +150,7 @@ internal fun injectCompanionInitBlocks(
 
     injectBridgeIntoConstructor(
       companion, targetFqn, clazz,
-      kclassJsGetterSymbol, bridgeRegisterSymbol, pluginContext,
+      kclassJsGetterSymbol, bridgeRegisterSymbol, pluginContext, opsCall,
     )
   }
 }
@@ -133,6 +169,7 @@ internal fun injectBridgeIntoConstructor(
   kclassJsGetterSymbol: IrSimpleFunctionSymbol,
   bridgeRegisterSymbol: IrSimpleFunctionSymbol,
   pluginContext: IrPluginContext,
+  extraCallSymbol: IrSimpleFunctionSymbol? = null,
 ) {
   val ctor = companion.declarations.filterIsInstance<IrConstructor>()
     .firstOrNull { it.isPrimary } ?: return
@@ -156,9 +193,12 @@ internal fun injectBridgeIntoConstructor(
     arguments[1] = jsCtorCall
   }
 
+  val extraCall = extraCallSymbol?.let { builder.irCall(it) }
+
   val body = ctor.body
   if (body is IrBlockBody) {
     body.statements.add(1, bridgeCall)
+    if (extraCall != null) body.statements.add(2, extraCall)
   } else {
     val superCall = (body as? IrExpressionBody)?.expression
       ?: builder.irDelegatingConstructorCall(
@@ -169,6 +209,7 @@ internal fun injectBridgeIntoConstructor(
     ctor.body = builder.irBlockBody {
       +superCall
       +bridgeCall
+      if (extraCall != null) +extraCall
     }
   }
 }
@@ -225,3 +266,45 @@ internal fun addJsNameAnnotation(
   property.annotations += annotation
 }
 
+
+
+/** Name of the `@JsExport` hook the host calls after defining a guest module. */
+private const val BRIDGE_WARM_UP_FUNCTION_NAME = "__bridgeWarmUpHost2Js"
+
+/**
+ * Emits `@JsExport fun __bridgeWarmUpHost2Js(): Boolean` calling `publishValueOps()`, so the guest's
+ * value accessors exist before the host decodes anything. A bridged class's companion initializer
+ * also publishes them, but only once that class is first touched — later than the first conversion,
+ * since a generated converter can run before any class is touched at all.
+ */
+internal fun injectModuleLoadValueOpsPublication(
+  finder: DeclarationFinder,
+  pluginContext: IrPluginContext,
+  moduleFragment: IrModuleFragment,
+) {
+  val fileForModule = moduleFragment.files.firstOrNull() ?: return
+  val valueOpsSymbol = finder.findFunctions(
+    CallableId(FqName("app.cash.zipline"), Name.identifier("publishValueOps")),
+  ).firstOrNull() ?: return
+
+  val warmUpFn = pluginContext.irFactory.buildFun {
+    name = Name.identifier(BRIDGE_WARM_UP_FUNCTION_NAME)
+    returnType = pluginContext.irBuiltIns.booleanType
+    visibility = DescriptorVisibilities.PUBLIC
+    origin = IrDeclarationOrigin.DEFINED
+  }
+  warmUpFn.parent = fileForModule
+  val jsExportCtor = finder.findClass(ClassId(FqName("kotlin.js"), Name.identifier("JsExport")))
+    ?.owner?.declarations?.filterIsInstance<IrConstructor>()?.firstOrNull { it.isPrimary }
+  if (jsExportCtor != null) {
+    warmUpFn.annotations += IrConstructorCallImpl(
+      UNDEFINED_OFFSET, UNDEFINED_OFFSET, jsExportCtor.returnType, jsExportCtor.symbol, 0, 0,
+    )
+  }
+  val builder = pluginContext.irBuiltIns.createIrBuilder(warmUpFn.symbol)
+  warmUpFn.body = builder.irBlockBody {
+    +irCall(valueOpsSymbol)
+    +irReturn(irBoolean(true))
+  }
+  fileForModule.declarations += warmUpFn
+}

@@ -90,6 +90,9 @@ public:
   static jclass quickJsExceptionClass;
   static jclass interruptHandlerClass;
   static jstring stringUtf8;
+  /** The guest's collection accessors (`globalThis.__zipline_bridgeValueOps`), fetched lazily. */
+  JSValue bridgeValueOps = JS_UNDEFINED;
+
   static jmethodID booleanValueOf;
   static jmethodID integerValueOf;
   static jmethodID doubleValueOf;
@@ -116,6 +119,12 @@ public:
   static jmethodID arrayListInit;
   static jmethodID arrayListInitWithCapacity;
   static jmethodID arrayListAdd;
+  static jclass linkedHashMapClass;
+  static jmethodID linkedHashMapInit;
+  static jmethodID mapPut;
+  static jclass linkedHashSetClass;
+  static jmethodID linkedHashSetInit;
+  static jmethodID setAdd;
 
   // JNI cache for the RdmaChangeSink interface and kotlin.Pair
   static jmethodID rdmaSinkCreateCreate;
