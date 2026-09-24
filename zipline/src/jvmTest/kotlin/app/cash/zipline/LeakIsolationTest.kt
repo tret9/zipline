@@ -1,8 +1,8 @@
 package app.cash.zipline
 
+import app.cash.zipline.testing.loadJsModuleForTest
 import app.cash.zipline.testing.loadTestingJs
 import app.cash.zipline.testing.loadTestingJsModulesOnly
-import app.cash.zipline.testing.loadJsModuleForTest
 import app.cash.zipline.testing.loadTestingJsModulesOnlyOnEngine
 import app.cash.zipline.testing.loadTestingJsOnEngine
 import kotlin.test.Ignore
@@ -229,7 +229,7 @@ class LeakIsolationTest {
       val afterClose = rssBytes()
       println(
         "probe cycle=$i create=$afterCreate require=$afterRequire gc=$afterGc close=$afterClose" +
-          " hermesAlloc=${usage.allocatedBytes} heap=${usage.heapSize}"
+          " hermesAlloc=${usage.allocatedBytes} heap=${usage.heapSize}",
       )
     }
   }
@@ -257,7 +257,7 @@ class LeakIsolationTest {
       val afterClose = rssBytes()
       println(
         "probeNoCh cycle=$i create=$afterCreate require=$afterRequire close=$afterClose" +
-          " hermesAlloc=${usage.allocatedBytes} heap=${usage.heapSize}"
+          " hermesAlloc=${usage.allocatedBytes} heap=${usage.heapSize}",
       )
     }
   }
@@ -314,7 +314,7 @@ class LeakIsolationTest {
       "globalThis.app_cash_zipline_outboundChannel = {" +
         "  call: function(s) { return '[]'; }," +
         "  disconnect: function(n) { return true; }" +
-        "};"
+        "};",
     )
     js.loadTestingJsModulesOnlyOnEngine()
     js.evaluate("globalThis.m = require('./kotlinx-coroutines-core.js');")
@@ -336,7 +336,7 @@ class LeakIsolationTest {
       "globalThis.unrelatedGlobal = {" +
         "  call: function(s) { return '[]'; }," +
         "  disconnect: function(n) { return true; }" +
-        "};"
+        "};",
     )
     js.loadTestingJsModulesOnlyOnEngine()
     js.evaluate("globalThis.m = require('./kotlinx-coroutines-core.js');")

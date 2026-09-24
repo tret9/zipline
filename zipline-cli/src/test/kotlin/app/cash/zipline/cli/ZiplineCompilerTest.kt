@@ -122,7 +122,8 @@ class ZiplineCompilerTest {
   }
 
   @Test
-  fun `no source map`() {    val moduleNameToFile = compile("src/test/resources/happyPathNoSourceMap/", false)
+  fun `no source map`() {
+    val moduleNameToFile = compile("src/test/resources/happyPathNoSourceMap/", false)
     for ((_, ziplineFile) in moduleNameToFile) {
       jsEngine.execute(ziplineFile.jsBytecode.toByteArray())
     }

@@ -46,7 +46,7 @@ class JsEngineExtensionsTest {
         };
       });
       """,
-      "myModule.js"
+      "myModule.js",
     )
     loadJsModule(jsEngine, "myModule", moduleBytecode)
 
@@ -67,7 +67,7 @@ class JsEngineExtensionsTest {
         };
       });
       """,
-      "testModule.js"
+      "testModule.js",
     )
 
     loadJsModule(jsEngine, "testModule", moduleBytecode)
@@ -91,7 +91,7 @@ class JsEngineExtensionsTest {
         };
       });
       """,
-      "main.js"
+      "main.js",
     )
     loadJsModule(jsEngine, "main", mainModuleBytecode)
 

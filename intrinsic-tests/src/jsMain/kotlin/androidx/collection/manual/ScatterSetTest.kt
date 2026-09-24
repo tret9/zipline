@@ -2,10 +2,10 @@ package androidx.collection.manual
 
 import androidx.collection.MutableScatterSet
 import androidx.collection.ScatterSet
-import androidx.collection.mutableScatterSetOf
 import androidx.collection.emptyScatterSet
-import androidx.collection.scatterSetOf
+import androidx.collection.mutableScatterSetOf
 import androidx.collection.objectListOf
+import androidx.collection.scatterSetOf
 
 class ScatterSetTest : Tests {
     override fun tests(): List<Pair<String, () -> Unit>> = listOf(
@@ -79,7 +79,7 @@ class ScatterSetTest : Tests {
         "removeIf" to { removeIf() },
         "insertOneRemoveOne" to { insertOneRemoveOne() },
         "removeWhenIterating" to { removeWhenIterating() },
-        "removeWhenForEach" to { removeWhenForEach() }
+        "removeWhenForEach" to { removeWhenForEach() },
     )
 
     private fun emptyScatterSetConstructor() {
@@ -536,20 +536,20 @@ class ScatterSetTest : Tests {
         set.forEach { element -> order[index++] = element }
         checkEquals(
             "${order[0]}, ${order[1]}, ${order[2]}, ${order[3]}, ${order[4]}",
-            set.joinToString()
+            set.joinToString(),
         )
         checkEquals(
             "x${order[0]}, ${order[1]}, ${order[2]}...",
-            set.joinToString(prefix = "x", postfix = "y", limit = 3)
+            set.joinToString(prefix = "x", postfix = "y", limit = 3),
         )
         checkEquals(
             ">${order[0]}-${order[1]}-${order[2]}-${order[3]}-${order[4]}<",
-            set.joinToString(separator = "-", prefix = ">", postfix = "<")
+            set.joinToString(separator = "-", prefix = ">", postfix = "<"),
         )
         val names = arrayOf("one", "two", "three", "four", "five")
         checkEquals(
             "${names[order[0]]}, ${names[order[1]]}, ${names[order[2]]}...",
-            set.joinToString(limit = 3) { names[it] }
+            set.joinToString(limit = 3) { names[it] },
         )
     }
 
@@ -789,11 +789,11 @@ class ScatterSetTest : Tests {
         set.addAll(
             arrayOf(
                 "Hello", "World", "Hola", "Mundo", "Bonjour", "Monde",
-                "Hallo", "Welt", "Konnichiwa", "Sekai", "Ciao", "Mondo", "Annyeong", "Sesang"
-            )
+                "Hallo", "Welt", "Konnichiwa", "Sekai", "Ciao", "Mondo", "Annyeong", "Sesang",
+            ),
         )
         set.removeAll(
-            arrayOf("Hallo", "Welt", "Konnichiwa", "Sekai", "Ciao", "Mondo", "Annyeong", "Sesang")
+            arrayOf("Hallo", "Welt", "Konnichiwa", "Sekai", "Ciao", "Mondo", "Annyeong", "Sesang"),
         )
         checkCondition(set.trim() > 0)
         checkEquals(capacity, set.capacity)

@@ -84,16 +84,14 @@ actual class JsEngine private constructor(
    * to [path]. Must be called on the Zipline dispatcher thread. Returns
    * false on IO failure.
    */
-  fun stopHeapSampling(path: String): Boolean =
-    nativeStopHeapSampling(context, path)
+  fun stopHeapSampling(path: String): Boolean = nativeStopHeapSampling(context, path)
 
   /**
    * Writes a full Chrome DevTools heap snapshot (JSON) to [path]. Performs a
    * GC first. Must be called on the Zipline dispatcher thread. Returns false
    * on IO failure.
    */
-  fun dumpHeapSnapshot(path: String): Boolean =
-    nativeDumpHeapSnapshot(context, path)
+  fun dumpHeapSnapshot(path: String): Boolean = nativeDumpHeapSnapshot(context, path)
 
   /** Hermes heap limit is fixed at runtime construction; resizing is unsupported. */
   actual var memoryLimit: Long
@@ -275,6 +273,7 @@ actual class JsEngine private constructor(
   private external fun cdpDrainTasks(context: Long)
   private external fun cdpResetAgent(context: Long)
   private external fun cdpDetach(context: Long)
+
   @JvmName("initRdmaChangesChannel")
   private external fun initRdmaChangesChannel(context: Long, rdmaChangeSink: RdmaChangeSink?)
 

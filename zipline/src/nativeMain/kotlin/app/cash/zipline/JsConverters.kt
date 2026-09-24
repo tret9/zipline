@@ -13,6 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Wildcard: generated Hermes cinterop bindings. Function names: called by name from generated
+// bridge code.
+@file:Suppress("ktlint:standard:no-wildcard-imports", "ktlint:standard:function-naming")
 @file:OptIn(ExperimentalForeignApi::class)
 
 package app.cash.zipline
@@ -38,7 +41,9 @@ fun JsNumberToLong(context: COpaquePointer?, handle: Int): Long {
   if (context == null) return 0L
   return when (HermesBridge_getValueTag(context, handle)) {
     TAG_INT -> HermesBridge_getValueDouble(context, handle).toInt().toLong()
+
     TAG_DOUBLE -> HermesBridge_getValueDouble(context, handle).toLong()
+
     else -> {
       val lowRef = HermesBridge_createHandle(context, handle, "low_1")
       val highRef = HermesBridge_createHandle(context, handle, "high_1")
@@ -123,11 +128,13 @@ fun JsBoxedNumberToLong(context: COpaquePointer?, handle: Int): Long? {
         try {
           when (HermesBridge_getValueTag(context, propRef)) {
             TAG_INT, TAG_DOUBLE -> return HermesBridge_getValueDouble(context, propRef).toLong()
+
             TAG_OBJECT -> {
               val lowRef = HermesBridge_createHandle(context, propRef, "low_1")
               val highRef = HermesBridge_createHandle(context, propRef, "high_1")
               if (HermesBridge_getValueTag(context, lowRef) != TAG_UNDEFINED &&
-                HermesBridge_getValueTag(context, highRef) != TAG_UNDEFINED) {
+                HermesBridge_getValueTag(context, highRef) != TAG_UNDEFINED
+              ) {
                 val low = HermesBridge_getValueDouble(context, lowRef).toInt()
                 val high = HermesBridge_getValueDouble(context, highRef).toInt()
                 HermesBridge_freeHandle(context, highRef)
@@ -158,12 +165,16 @@ fun bridgeForAny(context: COpaquePointer?, handle: Int): Any? {
   if (context == null) return null
   return when (HermesBridge_getValueTag(context, handle)) {
     TAG_INT, TAG_DOUBLE -> HermesBridge_getValueDouble(context, handle)
+
     TAG_BOOL -> HermesBridge_getValueBool(context, handle) != 0
+
     TAG_STRING -> {
       val str = HermesBridge_getValueString(context, handle)
       str?.toKStringFromUtf8()?.also { platform.posix.free(str) }
     }
+
     TAG_NULL, TAG_UNDEFINED -> null
+
     TAG_ARRAY -> {
       val length = HermesBridge_getArrayLength(context, handle)
       (0 until length).map { index ->
@@ -175,6 +186,7 @@ fun bridgeForAny(context: COpaquePointer?, handle: Int): Any? {
         }
       }
     }
+
     else -> {
       val dispPtr = HermesBridge_getBridgeDispatch(context, handle)
       if (dispPtr != 0L) {

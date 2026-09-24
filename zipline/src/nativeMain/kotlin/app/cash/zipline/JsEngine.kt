@@ -1,3 +1,4 @@
+@file:Suppress("ktlint:standard:no-wildcard-imports") // Generated Hermes cinterop bindings.
 @file:OptIn(ExperimentalForeignApi::class, ExperimentalAtomicApi::class)
 
 package app.cash.zipline
@@ -93,17 +94,21 @@ private fun hermesValueToJsonElement(context: COpaquePointer?, handle: Int): Jso
     val tag = HermesBridge_getValueTag(context, handle)
     return when (tag) {
         1 -> JsonPrimitive(HermesBridge_getValueDouble(context, handle).toInt())
+
         2 -> {
             val d = HermesBridge_getValueDouble(context, handle)
             val l = d.toLong()
             if (l.toDouble() == d) JsonPrimitive(l) else JsonPrimitive(d)
         }
+
         3 -> {
             val str = HermesBridge_getValueString(context, handle)
             val kstr = str?.toKStringFromUtf8()?.also { platform.posix.free(str) } ?: ""
             JsonPrimitive(kstr)
         }
+
         4 -> JsonPrimitive(HermesBridge_getValueBool(context, handle) != 0)
+
         6 -> {
             val len = HermesBridge_getArrayLength(context, handle)
             val items = mutableListOf<JsonElement>()
@@ -116,6 +121,7 @@ private fun hermesValueToJsonElement(context: COpaquePointer?, handle: Int): Jso
             }
             JsonArray(items)
         }
+
         5 -> {
             val keysHandle = HermesBridge_getObjectPropertyNames(context, handle)
             if (keysHandle == 0) return JsonNull
@@ -135,6 +141,7 @@ private fun hermesValueToJsonElement(context: COpaquePointer?, handle: Int): Jso
             HermesBridge_freeHandle(context, keysHandle)
             JsonObject(props)
         }
+
         else -> JsonNull
     }
 }
@@ -256,7 +263,7 @@ private fun cdpDisposedCallback(context: COpaquePointer?) {
 @OptIn(ExperimentalForeignApi::class)
 @EngineApi
 actual class JsEngine private constructor(
-  private val contextPointer: COpaquePointer?,
+  internal val contextPointer: COpaquePointer?,
 ) : AutoCloseable {
   private var closed = false
 
@@ -341,16 +348,22 @@ actual class JsEngine private constructor(
     HERMES_TAG_ERROR -> throw JsException(
       HermesContext_getLastError(contextPointer)?.toKString() ?: errorFallback,
     )
+
     HERMES_TAG_NULL -> null
+
     HERMES_TAG_INT -> number.toInt()
+
     // Numbers always cross as double; re-narrow integral values to Int.
     HERMES_TAG_DOUBLE -> number.toInt().let { if (it.toDouble() == number) it else number }
+
     HERMES_TAG_BOOL -> number != 0.0
+
     HERMES_TAG_STRING -> {
       val value = string!!.toKString()
       HermesContext_freeValue(contextPointer, string)
       value
     }
+
     else -> null
   }
 
@@ -513,7 +526,7 @@ actual class JsEngine private constructor(
     HermesContext_setOutboundChannelCallbacks(
       context,
       staticCFunction(::outboundChannelCallCallback),
-      staticCFunction(::outboundChannelDisconnectCallback)
+      staticCFunction(::outboundChannelDisconnectCallback),
     )
     val result = HermesContext_setupOutboundCallChannel(contextPointer)
     if (result == 0) {
@@ -527,7 +540,7 @@ actual class JsEngine private constructor(
     if (HermesContext_hasGlobalObject(contextPointer, INBOUND_CHANNEL_NAME) != 1) {
       throw IllegalStateException(
         "A global JavaScript object called $INBOUND_CHANNEL_NAME was not found. " +
-          "Try confirming that Zipline.get() has been called."
+          "Try confirming that Zipline.get() has been called.",
       )
     }
     return object : CallChannel {
@@ -536,7 +549,7 @@ actual class JsEngine private constructor(
         val resultPtr: CPointer<ByteVar>? = HermesContext_callInbound(
           contextPointer,
           INBOUND_CHANNEL_NAME,
-          callJson
+          callJson,
         )
         if (resultPtr == null) {
           val error = HermesContext_getLastError(contextPointer)
@@ -552,7 +565,7 @@ actual class JsEngine private constructor(
         val resultPtr: CPointer<ByteVar>? = HermesContext_callInboundDisconnect(
           contextPointer,
           INBOUND_CHANNEL_NAME,
-          instanceName
+          instanceName,
         )
         if (resultPtr == null) {
           val error = HermesContext_getLastError(contextPointer)
@@ -665,4 +678,3 @@ actual class JsEngine private constructor(
     }
   }
 }
-

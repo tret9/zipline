@@ -13,7 +13,13 @@ import org.jetbrains.kotlin.ir.builders.irBlockBody
 import org.jetbrains.kotlin.ir.builders.irCall
 import org.jetbrains.kotlin.ir.builders.irDelegatingConstructorCall
 import org.jetbrains.kotlin.ir.builders.irString
-import org.jetbrains.kotlin.ir.declarations.*
+import org.jetbrains.kotlin.ir.declarations.IrClass
+import org.jetbrains.kotlin.ir.declarations.IrConstructor
+import org.jetbrains.kotlin.ir.declarations.IrDeclarationOrigin
+import org.jetbrains.kotlin.ir.declarations.IrModuleFragment
+import org.jetbrains.kotlin.ir.declarations.IrParameterKind
+import org.jetbrains.kotlin.ir.declarations.IrProperty
+import org.jetbrains.kotlin.ir.declarations.IrSimpleFunction
 import org.jetbrains.kotlin.ir.expressions.IrBlockBody
 import org.jetbrains.kotlin.ir.expressions.IrExpressionBody
 import org.jetbrains.kotlin.ir.expressions.impl.IrClassReferenceImpl
@@ -21,8 +27,8 @@ import org.jetbrains.kotlin.ir.expressions.impl.IrConstImpl
 import org.jetbrains.kotlin.ir.expressions.impl.IrConstructorCallImpl
 import org.jetbrains.kotlin.ir.symbols.IrSimpleFunctionSymbol
 import org.jetbrains.kotlin.ir.types.IrType
-import org.jetbrains.kotlin.ir.types.starProjectedType
 import org.jetbrains.kotlin.ir.types.getClass
+import org.jetbrains.kotlin.ir.types.starProjectedType
 import org.jetbrains.kotlin.ir.util.classId
 import org.jetbrains.kotlin.ir.util.createThisReceiverParameter
 import org.jetbrains.kotlin.ir.util.defaultType
@@ -82,12 +88,18 @@ internal fun injectCompanionInitBlocks(
       .filterIsInstance<IrConstructor>()
       .firstOrNull { it.isPrimary }!!
     bridgeRegisterFn.annotations += IrConstructorCallImpl(
-      UNDEFINED_OFFSET, UNDEFINED_OFFSET,
-      jsNameCtor.returnType, jsNameCtor.symbol, 0, 1,
+      UNDEFINED_OFFSET,
+      UNDEFINED_OFFSET,
+      jsNameCtor.returnType,
+      jsNameCtor.symbol,
+      0,
+      1,
     ).apply {
       arguments[0] = IrConstImpl.string(
-        UNDEFINED_OFFSET, UNDEFINED_OFFSET,
-        pluginContext.irBuiltIns.stringType, "__bridgeRegister",
+        UNDEFINED_OFFSET,
+        UNDEFINED_OFFSET,
+        pluginContext.irBuiltIns.stringType,
+        "__bridgeRegister",
       )
     }
     fileForModule.declarations += bridgeRegisterFn
@@ -100,8 +112,12 @@ internal fun injectCompanionInitBlocks(
 
     if (clazz.isCompanion || clazz.kind == ClassKind.OBJECT) {
       injectBridgeIntoConstructor(
-        clazz, targetFqn, clazz,
-        kclassJsGetterSymbol, bridgeRegisterSymbol, pluginContext,
+        clazz,
+        targetFqn,
+        clazz,
+        kclassJsGetterSymbol,
+        bridgeRegisterSymbol,
+        pluginContext,
       )
       continue
     }
@@ -113,8 +129,12 @@ internal fun injectCompanionInitBlocks(
     }
 
     injectBridgeIntoConstructor(
-      companion, targetFqn, clazz,
-      kclassJsGetterSymbol, bridgeRegisterSymbol, pluginContext,
+      companion,
+      targetFqn,
+      clazz,
+      kclassJsGetterSymbol,
+      bridgeRegisterSymbol,
+      pluginContext,
     )
   }
 }
@@ -140,9 +160,11 @@ internal fun injectBridgeIntoConstructor(
 
   // Foo::class
   val classRef = IrClassReferenceImpl(
-    UNDEFINED_OFFSET, UNDEFINED_OFFSET,
+    UNDEFINED_OFFSET,
+    UNDEFINED_OFFSET,
     pluginContext.irBuiltIns.kClassClass.starProjectedType,
-    clazz.symbol, clazz.defaultType,
+    clazz.symbol,
+    clazz.defaultType,
   )
 
   // Foo::class.js — calls the KClass.js extension property getter at IR level
@@ -164,7 +186,7 @@ internal fun injectBridgeIntoConstructor(
       ?: builder.irDelegatingConstructorCall(
         pluginContext.irBuiltIns.anyClass.owner.declarations
           .filterIsInstance<IrConstructor>()
-          .first { it.isPrimary }
+          .first { it.isPrimary },
       )
     ctor.body = builder.irBlockBody {
       +superCall
@@ -201,7 +223,6 @@ internal fun createCompanion(clazz: IrClass, pluginContext: IrPluginContext): Ir
 
 // -- array extraction helpers --
 
-
 // -- @JsName annotation helper --
 
 internal fun addJsNameAnnotation(
@@ -211,17 +232,19 @@ internal fun addJsNameAnnotation(
   stringType: IrType,
 ) {
   val nameExpr = IrConstImpl.string(
-    UNDEFINED_OFFSET, UNDEFINED_OFFSET,
+    UNDEFINED_OFFSET,
+    UNDEFINED_OFFSET,
     stringType,
     name,
   )
   val annotation = IrConstructorCallImpl(
-    UNDEFINED_OFFSET, UNDEFINED_OFFSET,
+    UNDEFINED_OFFSET,
+    UNDEFINED_OFFSET,
     jsNameCtor.returnType,
     jsNameCtor.symbol,
-    0, 1,
+    0,
+    1,
   )
   annotation.arguments[0] = nameExpr
   property.annotations += annotation
 }
-

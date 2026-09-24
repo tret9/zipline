@@ -69,7 +69,10 @@ actual class JsException @JvmOverloads constructor(
         el.fileName
       }
       return StackTraceElement(
-        el.className, el.methodName, stripped, el.lineNumber
+        el.className,
+        el.methodName,
+        stripped,
+        el.lineNumber,
       )
     }
 
@@ -93,7 +96,7 @@ actual class JsException @JvmOverloads constructor(
       val (file, lineNumber) = when (parts.size) {
         1 -> filePart to -1
         2 -> parts[0] to (parts[1].toIntOrNull() ?: -1)
-        else -> parts[0] to (parts[1].toIntOrNull() ?: -1)  // drop column
+        else -> parts[0] to (parts[1].toIntOrNull() ?: -1) // drop column
       }
       return StackTraceElement(STACK_TRACE_CLASS_NAME, name, file, lineNumber)
     }

@@ -24,7 +24,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import okio.IOException
 
-/**
+/*
  * Exposes a running [JsEngine] to Chrome DevTools via the Chrome DevTools Protocol (CDP).
  *
  * This is the platform-neutral core: debug sessions, the CDP message dispatch
@@ -58,6 +58,7 @@ internal class CdpDebugServer(
 ) {
   private val sessionsLock = Mutex()
   private val sessions = mutableListOf<DebugSession>()
+
   /**
    * Work queue for blocking fetches to the dev server, serviced by a small
    * fixed pool. DevTools fires hundreds of resource requests (every .js,
@@ -91,7 +92,8 @@ internal class CdpDebugServer(
   fun attach(jsEngine: JsEngine, scope: CoroutineScope) {
     // Locked: Zipline instances may be created concurrently, and the
     // smallest-free-id check-then-act below must not hand out duplicate ids.
-    runBlocking { sessionsLock.withLock {
+    runBlocking {
+      sessionsLock.withLock {
       // Assign the smallest free id so the usual single-engine flow keeps a
       // stable "1" across hot-reloads (DevTools URLs stay valid).
       val id = generateSequence(1L) { it + 1 }
@@ -104,22 +106,23 @@ internal class CdpDebugServer(
         sessions.add(session)
         log("info", "Zipline CDP: debug session ${session.id} attached (port $port)", null)
       }
-    } }
+    }
+    }
   }
 
   fun detach(jsEngine: JsEngine) {
-    val session = runBlocking { sessionsLock.withLock {
+    val session = runBlocking {
+      sessionsLock.withLock {
       sessions.firstOrNull { it.jsEngine === jsEngine }?.also { sessions.remove(it) }
-    } } ?: return
+    }
+    } ?: return
     runBlocking { session.close() }
   }
 
   /** The session for `/devtools/page/<id>`, or null when unknown. */
-  suspend fun session(id: String): DebugSession? =
-    sessionsLock.withLock { sessions.firstOrNull { it.id == id } }
+  suspend fun session(id: String): DebugSession? = sessionsLock.withLock { sessions.firstOrNull { it.id == id } }
 
-  private suspend fun firstSessionId(): String? =
-    sessionsLock.withLock { sessions.firstOrNull()?.id }
+  private suspend fun firstSessionId(): String? = sessionsLock.withLock { sessions.firstOrNull()?.id }
 
   /** The `/json/version` response body. [host] is the request's Host header. */
   suspend fun versionJson(host: String?): String {
@@ -313,7 +316,8 @@ internal class CdpDebugServer(
           val handle = params?.get("handle").asString()
           if (requestId != null && handle != null) {
             serveIoRead(
-              requestId, handle,
+              requestId,
+              handle,
               params?.get("offset").asString()?.toIntOrNull(),
               params?.get("size").asString()?.toIntOrNull(),
             )
@@ -326,10 +330,12 @@ internal class CdpDebugServer(
           val handle = message?.get("params").asObject()?.get("handle").asString()
           if (requestId != null && handle != null) {
             mapsLock.withLock { ioStreams.remove(handle) }
-            sendToClients(buildJsonObject {
+            sendToClients(
+              buildJsonObject {
               put("id", requestId.toLongOrNull() ?: 0L)
               putJsonObject("result") {}
-            }.toString())
+            }.toString(),
+            )
             return
           }
         }
@@ -395,12 +401,14 @@ internal class CdpDebugServer(
           "Zipline CDP: getPossibleBreakpoints scriptId=$scriptId -> ${locations.size} locations in ${mark.elapsedNow()}",
           null,
         )
-        sendToClients(buildJsonObject {
+        sendToClients(
+          buildJsonObject {
           put("id", requestId.toLongOrNull() ?: 0L)
           putJsonObject("result") {
             put("locations", JsonArray(locations))
           }
-        }.toString())
+        }.toString(),
+        )
       }
     }
 
@@ -715,11 +723,9 @@ internal class CdpDebugServer(
     }
   }
 
-  private fun JsonElement?.asObject(): JsonObject? =
-    this as? JsonObject
+  private fun JsonElement?.asObject(): JsonObject? = this as? JsonObject
 
-  private fun JsonElement?.asString(): String? =
-    (this as? JsonPrimitive)?.contentOrNull
+  private fun JsonElement?.asString(): String? = (this as? JsonPrimitive)?.contentOrNull
 }
 
 private data class IoStream(val content: String, var position: Int = 0)

@@ -15,13 +15,5 @@
  */
 package app.cash.zipline
 
-import kotlin.native.runtime.GC
-import kotlin.native.runtime.NativeRuntimeApi
-
-/** No managed host heap on Kotlin/Native; the check is skipped for -1. */
-internal actual fun heapUsedBytes(): Long = -1L
-
-@OptIn(NativeRuntimeApi::class)
-internal actual fun gcCollect() {
-  GC.collect()
-}
+/** Kotlin/Native's Linux platform.posix doesn't expose getrusage; the check is skipped for -1. */
+internal actual fun rssBytes(): Long = -1L

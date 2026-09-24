@@ -83,7 +83,8 @@ class CdpDebugTest {
       // Breakpoint on `return x + 1;` (0-based line 2; line 1 is constant-folded
       // away by the optimizer).
       cdp.send(
-        3, "Debugger.setBreakpointByUrl",
+        3,
+        "Debugger.setBreakpointByUrl",
         """"params":{"url":"$SCRIPT_URL","lineNumber":2}""",
       )
       val setBpResponse = cdp.awaitResponse(3)
@@ -141,10 +142,13 @@ class CdpDebugTest {
       // ourselves here on the URL baked into servedScriptBytecode.
       val scriptSource = "function hitMe() { return 42; }"
       val sourceMap = """{"version":3,"file":"test.js","sources":["test.kt"],"names":[],"mappings":"AAAA,EAAE"}"""
-      val httpd = MiniHttpServer(SOURCE_SERVER_PORT, mapOf(
+      val httpd = MiniHttpServer(
+        SOURCE_SERVER_PORT,
+        mapOf(
         "/test.js" to scriptSource,
         "/test.js.map" to sourceMap,
-      ))
+      ),
+      )
       try {
         httpd.start()
         withContext(dispatcher) {
@@ -160,7 +164,8 @@ class CdpDebugTest {
         )
 
         cdp.send(
-          30, "Debugger.getPossibleBreakpoints",
+          30,
+          "Debugger.getPossibleBreakpoints",
           """"params":{"start":{"scriptId":"$scriptId","lineNumber":0,"columnNumber":0},"end":{"scriptId":"$scriptId","lineNumber":10,"columnNumber":0}}""",
         )
         val possible = cdp.awaitResponse(30)
@@ -313,6 +318,5 @@ class CdpDebugTest {
         "AAAAAAAAAAAAAAAAAQEBAAUAfwYFAAEFAQAHAQAGAQAFAwABARkAfwEBAQEABQB/AwEACQUAAQcL" +
         "CAMECwEBBwEABQF5f2L2vItC2AqOU9zbjfS6m9ONKbEU",
     )
-
   }
 }

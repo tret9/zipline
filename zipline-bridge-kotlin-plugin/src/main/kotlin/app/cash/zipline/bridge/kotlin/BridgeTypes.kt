@@ -86,6 +86,7 @@ data class FieldInfo(
           kotlinToJniFieldType[typeStr]!!
         }
       }
+
       else -> irClass?.let { jniTypeDescriptorForClass(it) } ?: jniFieldDescriptor(typeStr)
     }
   }
@@ -107,7 +108,9 @@ data class FieldInfo(
       (type as? IrSimpleType)?.arguments
         ?.firstOrNull()
         ?.let { (it as? IrTypeProjection)?.type ?: (it as? IrType) }
-    } else null
+    } else {
+      null
+    }
   }
 
   /** Raw IR type of the element for Array<T>/List<T>; null when unavailable. */
@@ -115,8 +118,7 @@ data class FieldInfo(
 }
 
 /** The [index]-th type argument of [type], if any. */
-internal fun typeArgument(type: IrType?, index: Int): IrType? =
-  (type as? IrSimpleType)?.arguments?.getOrNull(index)
+internal fun typeArgument(type: IrType?, index: Int): IrType? = (type as? IrSimpleType)?.arguments?.getOrNull(index)
     ?.let { (it as? IrTypeProjection)?.type ?: (it as? IrType) }
 
 /** Effective (erased / upper-bound / Any) class FQN of a type; mirrors FieldInfo.ktType. */
@@ -142,8 +144,7 @@ internal fun elementJniDescriptor(elementType: IrType?): String {
 }
 
 /** The single regular primary-constructor parameter type's class of an inline class, if any. */
-private fun inlineUnderlyingClass(clazz: IrClass?): IrClass? =
-  clazz?.declarations
+private fun inlineUnderlyingClass(clazz: IrClass?): IrClass? = clazz?.declarations
     ?.filterIsInstance<IrConstructor>()
     ?.firstOrNull { it.isPrimary }
     ?.parameters
@@ -273,8 +274,12 @@ val boxedPrimitiveInfo = mapOf(
 )
 
 val boxedJniDescriptor = mapOf(
-  "kotlin.Boolean" to "Ljava/lang/Boolean;", "kotlin.Byte" to "Ljava/lang/Byte;",
-  "kotlin.Char" to "Ljava/lang/Character;", "kotlin.Short" to "Ljava/lang/Short;",
-  "kotlin.Int" to "Ljava/lang/Integer;", "kotlin.Long" to "Ljava/lang/Long;",
-  "kotlin.Float" to "Ljava/lang/Float;", "kotlin.Double" to "Ljava/lang/Double;",
+  "kotlin.Boolean" to "Ljava/lang/Boolean;",
+  "kotlin.Byte" to "Ljava/lang/Byte;",
+  "kotlin.Char" to "Ljava/lang/Character;",
+  "kotlin.Short" to "Ljava/lang/Short;",
+  "kotlin.Int" to "Ljava/lang/Integer;",
+  "kotlin.Long" to "Ljava/lang/Long;",
+  "kotlin.Float" to "Ljava/lang/Float;",
+  "kotlin.Double" to "Ljava/lang/Double;",
 )

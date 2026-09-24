@@ -10,7 +10,7 @@ class CircularIntArrayTest : Tests {
         "overpoppingFromStart" to { overpoppingFromStart() },
         "overpoppingFromEnd" to { overpoppingFromEnd() },
         "removeFromEitherEnd" to { removeFromEitherEnd() },
-        "overremovalFromStart" to { overremovalFromStart() }
+        "overremovalFromStart" to { overremovalFromStart() },
     )
 
     private fun creatingWithZeroCapacity() {

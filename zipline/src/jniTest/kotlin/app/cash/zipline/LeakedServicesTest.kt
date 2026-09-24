@@ -25,8 +25,8 @@ import assertk.assertions.isEqualTo
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.After
-import org.junit.Ignore
 import org.junit.Before
+import org.junit.Ignore
 import org.junit.Test
 
 class LeakedServicesTest {
@@ -56,7 +56,8 @@ class LeakedServicesTest {
   }
 
   @Ignore("Depends on FinalizationRegistry-based leak tracking, unsupported on Hermes")
-  @Test fun jsLeaksService() = runTest(dispatcher) {
+  @Test
+  fun jsLeaksService() = runTest(dispatcher) {
     val supService = object : EchoService {
       override fun echo(request: EchoRequest): EchoResponse = error("unexpected call")
     }

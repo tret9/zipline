@@ -2,8 +2,7 @@ package app.cash.zipline.internal.cdp
 
 import app.cash.zipline.Zipline
 
-internal actual fun cdpDebugPort(): Int? =
-  Zipline.cdpDebugPort ?: generatedCdpDebugPort
+internal actual fun cdpDebugPort(): Int? = Zipline.cdpDebugPort ?: generatedCdpDebugPort
 
 /**
  * The port baked into the app by the Zipline Gradle plugin

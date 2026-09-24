@@ -1,8 +1,8 @@
 package androidx.collection.manual
 
 import androidx.collection.MutableIntSet
-import androidx.collection.mutableIntSetOf
 import androidx.collection.intSetOf
+import androidx.collection.mutableIntSetOf
 
 class IntSetTest : Tests {
     override fun tests(): List<Pair<String, () -> Unit>> = listOf(
@@ -19,7 +19,7 @@ class IntSetTest : Tests {
         "clear" to { clear() },
         "forEach" to { forEach() },
         "insertManyEntries" to { insertManyEntries() },
-        "string" to { string() }
+        "string" to { string() },
     )
 
     private fun emptyIntSetConstructor() {

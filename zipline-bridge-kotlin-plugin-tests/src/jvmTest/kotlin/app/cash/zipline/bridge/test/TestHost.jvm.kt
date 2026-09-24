@@ -12,7 +12,6 @@ import app.cash.zipline.internal.initModuleLoader
 import app.cash.zipline.internal.loadJsModule
 import java.util.Base64
 
-
 actual class TestHost actual constructor() {
   private val jsEngine = JsEngine.create()
 

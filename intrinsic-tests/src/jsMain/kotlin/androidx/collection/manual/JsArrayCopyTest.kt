@@ -107,4 +107,5 @@ private fun checkRangeIndexes(fromIndex: Int, toIndex: Int, size: Int) {
     }
 }
 
+@Suppress("ktlint:standard:function-naming") // Name of the JS intrinsic.
 private external fun _arrayCopy(source: dynamic, destination: dynamic, destinationOffset: Int, startIndex: Int, endIndex: Int)

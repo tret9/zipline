@@ -1,7 +1,6 @@
 package app.cash.zipline
 
 import app.cash.zipline.internal.cdp.CdpTestClient
-
 import java.io.EOFException
 import java.io.InputStream
 import java.net.HttpURLConnection
@@ -57,7 +56,8 @@ class SourceMapUrlProbeTest {
 
       // Breakpoint on `return x + 1;` (0-based line 2), after x is assigned.
       cdp.send(
-        3, "Debugger.setBreakpointByUrl",
+        3,
+        "Debugger.setBreakpointByUrl",
         """"params":{"url":"$SCRIPT_URL","lineNumber":2}""",
       )
       val setBp = cdp.awaitResponse(3)
@@ -71,14 +71,16 @@ class SourceMapUrlProbeTest {
       // Frame eval requires the in-memory scoping table; constant folding
       // aside, `x` must resolve and `1+2` must compute.
       cdp.send(
-        5, "Debugger.evaluateOnCallFrame",
+        5,
+        "Debugger.evaluateOnCallFrame",
         """"params":{"callFrameId":"0","expression":"x"}""",
       )
       val evalX = cdp.awaitResponse(5)
       assertTrue(evalX.contains("\"value\":41"), "frame eval of x: $evalX")
 
       cdp.send(
-        6, "Debugger.evaluateOnCallFrame",
+        6,
+        "Debugger.evaluateOnCallFrame",
         """"params":{"callFrameId":"0","expression":"1+2"}""",
       )
       val evalConst = cdp.awaitResponse(6)
