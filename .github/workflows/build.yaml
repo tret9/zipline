@@ -137,10 +137,12 @@ jobs:
       - uses: ./.github/actions/setup-build
 
       # x64 Apple targets are skipped: this runner is arm64. --continue reports every failing
-      # module in one run.
+      # module in one run. -PhermesProd=false: the lean Apple engine can't compile JS source, which
+      # the tests do.
       - run: >
           ./gradlew
           --continue
+          -PhermesProd=false
           apiCheck
           allTests
           test
