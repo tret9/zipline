@@ -136,9 +136,11 @@ jobs:
 
       - uses: ./.github/actions/setup-build
 
-      # x64 Apple targets are skipped: this runner is arm64.
+      # x64 Apple targets are skipped: this runner is arm64. --continue reports every failing
+      # module in one run.
       - run: >
           ./gradlew
+          --continue
           apiCheck
           allTests
           test
