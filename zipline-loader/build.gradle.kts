@@ -2,6 +2,8 @@ import com.android.build.api.variant.HostTestBuilder.Companion.UNIT_TEST_TYPE
 import com.vanniktech.maven.publish.JavadocJar
 import com.vanniktech.maven.publish.KotlinMultiplatform
 import com.vanniktech.maven.publish.MavenPublishBaseExtension
+import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
+import org.jetbrains.kotlin.konan.target.KonanTarget
 
 plugins {
   kotlin("multiplatform")
@@ -144,4 +146,21 @@ sqldelight {
 
 configure<MavenPublishBaseExtension> {
   configure(KotlinMultiplatform(javadocJar = JavadocJar.Empty()))
+}
+
+// macOS binaries link :zipline's host libhermesvm.dylib, which is not part of the klib. Point the
+// linker (and the test runtime) at it and make sure it is built first.
+kotlin.targets.withType<KotlinNativeTarget>().configureEach {
+  val (hostLibDir, buildTask) = when (konanTarget) {
+    KonanTarget.MACOS_ARM64 -> "macos-arm64" to ":zipline:buildHermesHostMacosArm64"
+    KonanTarget.MACOS_X64 -> "macos-x86_64" to ":zipline:buildHermesHostMacosX86_64"
+    else -> return@configureEach
+  }
+  binaries.all {
+    linkerOpts += listOf(
+      "-L${rootDir}/zipline/build/hermes-jni/$hostLibDir",
+      "-rpath", "${rootDir}/zipline/build/hermes-jni/$hostLibDir",
+    )
+    linkTaskProvider.configure { dependsOn(buildTask) }
+  }
 }

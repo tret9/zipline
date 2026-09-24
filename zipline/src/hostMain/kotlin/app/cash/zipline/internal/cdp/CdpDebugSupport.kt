@@ -17,7 +17,8 @@ internal object CdpDebugSupport {
 
   fun attachIfEnabled(jsEngine: JsEngine, scope: CoroutineScope) {
     val port = cdpDebugPort() ?: return
-    val server = runBlocking { serverLock.withLock {
+    val server = runBlocking {
+      serverLock.withLock {
       server ?: try {
         CdpDebugServer(port).also {
           initCdpServer(port, it).start()
@@ -33,7 +34,8 @@ internal object CdpDebugSupport {
         )
         null
       }
-    } } ?: return
+    }
+    } ?: return
     server.attach(jsEngine, scope)
   }
 

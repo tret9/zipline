@@ -7,51 +7,51 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Runtime tests for the JNI bridge dispatch (via QuickJs.evaluate()).
+ * Runtime tests for the JNI bridge dispatch (via JsEngine.evaluate() and evaluateForBridge()).
  * These exercise the same Context::toJavaObject path that the generated C bridges use.
  */
 class BridgeForAnyJvmTest {
-  private val quickJs = QuickJs.create()
+  private val engine = JsEngine.create()
 
   @AfterTest
   fun tearDown() {
-    quickJs.close()
+    engine.close()
   }
 
   @Test
   fun `evaluate returns Int`() {
-    assertEquals(1, quickJs.evaluate("1"))
+    assertEquals(1, engine.evaluate("1"))
   }
 
   @Test
   fun `evaluate returns Double`() {
-    assertEquals(3.14, quickJs.evaluate("3.14"))
+    assertEquals(3.14, engine.evaluate("3.14"))
   }
 
   @Test
   fun `evaluate returns Boolean`() {
-    assertEquals(true, quickJs.evaluate("true"))
-    assertEquals(false, quickJs.evaluate("false"))
+    assertEquals(true, engine.evaluate("true"))
+    assertEquals(false, engine.evaluate("false"))
   }
 
   @Test
   fun `evaluate returns String`() {
-    assertEquals("hello", quickJs.evaluate("'hello'"))
+    assertEquals("hello", engine.evaluate("'hello'"))
   }
 
   @Test
   fun `evaluate returns null for undefined`() {
-    assertNull(quickJs.evaluate("undefined"))
+    assertNull(engine.evaluate("undefined"))
   }
 
   @Test
   fun `evaluate returns null for null`() {
-    assertNull(quickJs.evaluate("null"))
+    assertNull(engine.evaluate("null"))
   }
 
   @Test
   fun `evaluate returns array`() {
-    val result = quickJs.evaluate("[1, 'two', true]") as Array<*>
+    val result = engine.evaluateForBridge("[1, 'two', true]", "test.js") as Array<*>
     assertEquals(3, result.size)
     assertEquals(1, result[0])
     assertEquals("two", result[1])

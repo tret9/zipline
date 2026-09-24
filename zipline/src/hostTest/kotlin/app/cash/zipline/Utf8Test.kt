@@ -75,6 +75,7 @@ class Utf8Test {
     }
     val expectedSubstring = when {
       isJni -> "JavaScript.f1(a🐝cdefg.js:4)"
+
       // Hermes native stack frames are file:line:column.
       else -> "at f1 (a🐝cdefg.js:4:3)"
     }

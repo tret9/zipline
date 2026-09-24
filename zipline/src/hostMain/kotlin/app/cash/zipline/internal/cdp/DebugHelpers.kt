@@ -2,7 +2,7 @@ package app.cash.zipline.internal.cdp
 
 import kotlinx.coroutines.launch
 
-/**
+/*
  * Platform plumbing for the CDP debug server: threads, locks, HTTP fetches
  * and port configuration. Actuals exist for JNI (java.net/Thread) and
  * Kotlin/Native (POSIX/coroutines) platforms.

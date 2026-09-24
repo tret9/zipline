@@ -38,6 +38,18 @@ static jsi::Runtime* getJsiRuntimeOrNull(void* context) {
     return static_cast<jsi::Runtime*>(runtime);
 }
 
+// Stores [value] in the bridge handle table and returns its handle. Handle 0
+// means "the global object" to HermesBridge_createHandle, so it is never
+// handed out: the first allocation reserves it.
+static int allocBridgeHandle(ContextNative* ctx, std::shared_ptr<jsi::Value> value) {
+    if (ctx->bridgeHandles.empty()) {
+        ctx->bridgeHandles.push_back(std::make_shared<jsi::Value>(jsi::Value::undefined()));
+    }
+    int handle = static_cast<int>(ctx->bridgeHandles.size());
+    ctx->bridgeHandles.push_back(std::move(value));
+    return handle;
+}
+
 namespace {
 
 char* copyToMalloc(const std::string& str) {
@@ -311,14 +323,7 @@ int HermesContext_executeToHandle(void* context, const uint8_t* bytecode, int by
     try {
         jsi::Value result = HermesCore_evaluateBytecode(
             ctx, bytecode, bytecodeSize, sourceURL ? sourceURL : "zipline-module.js");
-        // Handle 0 is reserved as "global object" in HermesBridge_createHandle, so
-        // the first real handle must start at 1.
-        if (ctx->bridgeHandles.empty()) {
-            ctx->bridgeHandles.push_back(std::make_shared<jsi::Value>(jsi::Value::undefined()));
-        }
-        int handle = static_cast<int>(ctx->bridgeHandles.size());
-        ctx->bridgeHandles.push_back(std::make_shared<jsi::Value>(*ctx->runtime, result));
-        return handle;
+        return allocBridgeHandle(ctx, std::make_shared<jsi::Value>(*ctx->runtime, result));
     } catch (const jsi::JSError& e) {
         ctx->lastError = e.getMessage() + std::string("\n") + e.getStack();
         snprintf(g_lastError, sizeof(g_lastError), "%s", e.getMessage().c_str());
@@ -475,8 +480,7 @@ int HermesContext_initRdmaChangesChannel(void* context) {
             }
             ContextNative* ctx = asNativeContext(context);
             if (!ctx->propertyChangeCb) return jsi::Value::undefined();
-            int handle = static_cast<int>(ctx->bridgeHandles.size());
-            ctx->bridgeHandles.push_back(std::make_shared<jsi::Value>(runtime, args[3]));
+            int handle = allocBridgeHandle(ctx, std::make_shared<jsi::Value>(runtime, args[3]));
             ctx->propertyChangeCb(context,
                 static_cast<int>(args[0].asNumber()),
                 static_cast<int>(args[1].asNumber()),
@@ -496,8 +500,7 @@ int HermesContext_initRdmaChangesChannel(void* context) {
             }
             ContextNative* ctx = asNativeContext(context);
             if (!ctx->modifierChangeCb) return jsi::Value::undefined();
-            int handle = static_cast<int>(ctx->bridgeHandles.size());
-            ctx->bridgeHandles.push_back(std::make_shared<jsi::Value>(runtime, args[1]));
+            int handle = allocBridgeHandle(ctx, std::make_shared<jsi::Value>(runtime, args[1]));
             ctx->modifierChangeCb(context, static_cast<int>(args[0].asNumber()), handle);
             HermesBridge_freeHandle(context, handle);
             return jsi::Value::undefined();
@@ -585,8 +588,7 @@ int HermesContext_initRdmaChangesChannel(void* context) {
             }
             ContextNative* ctx = asNativeContext(context);
             if (!ctx->bridgeChangeCb) return jsi::Value::undefined();
-            int handle = static_cast<int>(ctx->bridgeHandles.size());
-            ctx->bridgeHandles.push_back(std::make_shared<jsi::Value>(runtime, args[1]));
+            int handle = allocBridgeHandle(ctx, std::make_shared<jsi::Value>(runtime, args[1]));
             ctx->bridgeChangeCb(context, static_cast<int>(args[0].asNumber()), handle);
             HermesBridge_freeHandle(context, handle);
             return jsi::Value::undefined();
@@ -777,26 +779,21 @@ int HermesBridge_createHandle(void* context, int parentHandle, const char* name)
     if (!ctx || !ctx->runtime) return 0;
     jsi::Runtime& rt = *ctx->runtime;
 
-    // Allocate new handle
-    int handle = static_cast<int>(ctx->bridgeHandles.size());
-
     if (parentHandle == 0) {
         // 0 = no parent, create from global object
-        auto val = std::make_shared<jsi::Value>(rt.global().getProperty(rt, name));
-        ctx->bridgeHandles.push_back(val);
+        return allocBridgeHandle(
+            ctx, std::make_shared<jsi::Value>(rt.global().getProperty(rt, name)));
     } else if (parentHandle >= 0 && static_cast<size_t>(parentHandle) < ctx->bridgeHandles.size()) {
         auto& parent = ctx->bridgeHandles[parentHandle];
         if (parent->isObject()) {
-            auto val = std::make_shared<jsi::Value>(
-                parent->asObject(rt).getProperty(rt, name));
-            ctx->bridgeHandles.push_back(val);
+            return allocBridgeHandle(ctx, std::make_shared<jsi::Value>(
+                parent->asObject(rt).getProperty(rt, name)));
         } else {
             return 0;
         }
     } else {
         return 0;
     }
-    return handle;
 }
 
 int HermesBridge_createArrayElementHandle(void* context, int arrayHandle, int index) {
@@ -812,9 +809,7 @@ int HermesBridge_createArrayElementHandle(void* context, int arrayHandle, int in
     // Use getProperty by index so both plain JS arrays and Kotlin/JS typed
     // arrays (Int32Array, Float64Array, ...) are supported.
     jsi::Value elem = obj.getProperty(rt, std::to_string(index).c_str());
-    int handle = static_cast<int>(ctx->bridgeHandles.size());
-    ctx->bridgeHandles.push_back(std::make_shared<jsi::Value>(rt, elem));
-    return handle;
+    return allocBridgeHandle(ctx, std::make_shared<jsi::Value>(rt, elem));
 }
 
 int HermesBridge_getArrayLength(void* context, int handle) {
@@ -909,9 +904,7 @@ int HermesBridge_getObjectPropertyNames(void* context, int objectHandle) {
     if (obj.isArray(rt)) return 0;
 
     jsi::Array names = obj.getPropertyNames(rt);
-    int handle = static_cast<int>(ctx->bridgeHandles.size());
-    ctx->bridgeHandles.push_back(std::make_shared<jsi::Value>(rt, names));
-    return handle;
+    return allocBridgeHandle(ctx, std::make_shared<jsi::Value>(rt, names));
 }
 
 static jsi::Value bridgeFindMethod(jsi::Runtime& rt, const jsi::Value& obj, const char* prefix) {
@@ -992,12 +985,8 @@ int HermesBridge_getMapEntries(void* context, int mapHandle, int* keysHandleOut,
             values.setValueAtIndex(rt, i, valueVec[i]);
         }
 
-        int keysHandle = static_cast<int>(ctx->bridgeHandles.size());
-        ctx->bridgeHandles.push_back(std::make_shared<jsi::Value>(rt, keys));
-        int valuesHandle = static_cast<int>(ctx->bridgeHandles.size());
-        ctx->bridgeHandles.push_back(std::make_shared<jsi::Value>(rt, values));
-        *keysHandleOut = keysHandle;
-        *valuesHandleOut = valuesHandle;
+        *keysHandleOut = allocBridgeHandle(ctx, std::make_shared<jsi::Value>(rt, keys));
+        *valuesHandleOut = allocBridgeHandle(ctx, std::make_shared<jsi::Value>(rt, values));
         return 1;
     } catch (const jsi::JSError& e) {
         return 0;

@@ -223,7 +223,7 @@ class BridgedInterfaceImplementation : BridgedInterface {
 @WithJS2HostBridge
 data class BridgedGenericClass<T>(
   val value: T,
-  val list: List<T>
+  val list: List<T>,
 )
 
 /**
@@ -233,7 +233,7 @@ data class BridgedGenericClass<T>(
 data class BridgedMultiGenericClass<T, U>(
   val first: T,
   val second: U,
-  val both: Map<T, U>
+  val both: Map<T, U>,
 )
 
 /**
@@ -255,7 +255,7 @@ open class BridgedBoundedGenericBase {
 @WithJS2HostBridge
 data class BridgedBoundedGenericClass<T : BridgedBoundedGenericBase>(
   val value: T,
-  val list: List<T>
+  val list: List<T>,
 )
 
 /**
@@ -265,7 +265,7 @@ data class BridgedBoundedGenericClass<T : BridgedBoundedGenericBase>(
 data class BridgedNestedGeneric(
   val mapOfLists: Map<String, List<Int>>,
   val listOfMaps: List<Map<String, Int>>,
-  val complexNested: Map<String, List<Map<Int, String>>>
+  val complexNested: Map<String, List<Map<Int, String>>>,
 )
 
 /** Canonical values used both by the guest providers and the host assertions. */
@@ -287,7 +287,7 @@ object BridgedTestValues {
   val nested = BridgedNested(outer = data)
   val nullableNull = BridgedNullable(text = null, count = null)
   val nullableValue = BridgedNullable(text = "x", count = 1)
-  
+
   // New test values for collections
   val array = BridgedArray(
     intArray = intArrayOf(1, 2, 3),
@@ -299,21 +299,21 @@ object BridgedTestValues {
     shortArray = shortArrayOf(10, 20, 30),
     charArray = charArrayOf('a', 'b', 'c'),
     primitiveList = listOf(1, 2, 3),
-    stringList = listOf("a", "b", "c")
+    stringList = listOf("a", "b", "c"),
   )
-  
+
   val nestedStructure = BridgedNestedStructure(
     nestedArray = arrayOf(arrayOf(1, 2), arrayOf(3, 4)),
     nestedList = listOf(listOf("a", "b"), listOf("c", "d")),
-    mixedStructure = arrayOf(listOf(intArrayOf(1, 2), intArrayOf(3, 4)))
+    mixedStructure = arrayOf(listOf(intArrayOf(1, 2), intArrayOf(3, 4))),
   )
-  
+
   val emptyCollections = BridgedEmptyCollections(
     emptyArray = intArrayOf(),
     emptyList = listOf(),
-    emptyMap = mapOf()
+    emptyMap = mapOf(),
   )
-  
+
   // New test values for inheritance
   val baseClass = BridgedBaseClass()
   val inheritanceChild = BridgedInheritanceChild()
@@ -321,7 +321,7 @@ object BridgedTestValues {
   val overrideBase = BridgedOverrideBase()
   val overrideChild = BridgedOverrideChild()
   val interfaceImpl = BridgedInterfaceImplementation()
-  
+
   // New test values for generics
   val genericInt = BridgedGenericClass(42, listOf(1, 2, 3))
   val genericString = BridgedGenericClass("hello", listOf("a", "b", "c"))
@@ -330,6 +330,6 @@ object BridgedTestValues {
   val nestedGeneric = BridgedNestedGeneric(
     mapOfLists = mapOf("list1" to listOf(1, 2, 3)),
     listOfMaps = listOf(mapOf("a" to 1, "b" to 2)),
-    complexNested = mapOf("outer" to listOf(mapOf(1 to "one", 2 to "two")))
+    complexNested = mapOf("outer" to listOf(mapOf(1 to "one", 2 to "two"))),
   )
 }

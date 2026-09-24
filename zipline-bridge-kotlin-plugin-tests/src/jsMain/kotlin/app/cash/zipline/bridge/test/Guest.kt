@@ -47,6 +47,7 @@ fun provideBridgedNullableValue(): BridgedNullable = BridgedTestValues.nullableV
 // New exports for collections
 @JsExport
 fun provideBridgedArray(): BridgedArray = BridgedTestValues.array
+
 @JsExport
 fun provideBridgedNestedStructure(): BridgedNestedStructure = BridgedTestValues.nestedStructure
 

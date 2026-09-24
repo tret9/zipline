@@ -135,8 +135,10 @@ internal class ZiplineCompiler(
       when {
         resolved.path.startsWith(root.path + File.separator) ->
           JsonPrimitive(resolved.relativeTo(root).path)
+
         parent != null && resolved.path.startsWith(parent.path + File.separator) ->
           JsonPrimitive("__kt_root__/" + resolved.relativeTo(parent).path)
+
         else -> element
       }
     }

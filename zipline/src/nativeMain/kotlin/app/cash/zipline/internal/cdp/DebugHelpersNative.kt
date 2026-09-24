@@ -12,7 +12,6 @@ import platform.posix.getenv
  * var read and the fetch-candidate list. Everything else (server, WebSocket,
  * HTTP fetches) is multiplatform Ktor code shared with the JNI platforms.
  */
-internal actual fun cdpDebugPort(): Int? =
-  Zipline.cdpDebugPort ?: getenv("ZIPLINE_CDP_PORT")?.toKString()?.toIntOrNull()
+internal actual fun cdpDebugPort(): Int? = Zipline.cdpDebugPort ?: getenv("ZIPLINE_CDP_PORT")?.toKString()?.toIntOrNull()
 
 internal actual fun extraFetchCandidates(url: String): List<String> = emptyList()

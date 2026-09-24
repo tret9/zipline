@@ -1,9 +1,9 @@
 package androidx.collection.manual
 
+import androidx.collection.MutableIntObjectMap
+import androidx.collection.MutableIntSet
 import androidx.collection.MutableScatterMap
 import androidx.collection.MutableScatterSet
-import androidx.collection.MutableIntSet
-import androidx.collection.MutableIntObjectMap
 
 class CliveTest : Tests { // Clive = Class without equals
 
@@ -14,7 +14,7 @@ class CliveTest : Tests { // Clive = Class without equals
         "scatterMapWithObjectWithoutEquals" to { scatterMapWithObjectWithoutEquals() },
         "scatterSetWithObjectWithoutEquals" to { scatterSetWithObjectWithoutEquals() },
         "intSetBasic" to { intSetBasic() },
-        "intObjectMapBasic" to { intObjectMapBasic() }
+        "intObjectMapBasic" to { intObjectMapBasic() },
     )
 
     private fun scatterMapWithObjectWithoutEquals() {

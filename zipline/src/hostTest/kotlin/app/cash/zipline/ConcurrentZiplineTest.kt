@@ -201,21 +201,24 @@ class ConcurrentZiplineTest {
       // Modifying service bound to z1 only: calls through z1's real inbound
       // bridge mutate z1's state. z2 cannot see it at all.
       var z1Count = 0
-      z1.bind<EchoService>("statefulCounter", object : EchoService {
+      z1.bind<EchoService>(
+        "statefulCounter",
+        object : EchoService {
         override fun echo(request: EchoRequest): EchoResponse {
           z1Count++
           return EchoResponse("z1 #$z1Count")
         }
-      })
+      },
+      )
       // The guest in z1 calls the host-bound service through z1's inbound
       // bridge, mutating only z1's state.
       assertEquals(
         "z1 #1",
-        z1.jsEngine.evaluate("testing.app.cash.zipline.testing.callEchoServiceByName('statefulCounter', '')")
+        z1.jsEngine.evaluate("testing.app.cash.zipline.testing.callEchoServiceByName('statefulCounter', '')"),
       )
       assertEquals(
         "z1 #2",
-        z1.jsEngine.evaluate("testing.app.cash.zipline.testing.callEchoServiceByName('statefulCounter', '')")
+        z1.jsEngine.evaluate("testing.app.cash.zipline.testing.callEchoServiceByName('statefulCounter', '')"),
       )
       assertEquals(2, z1Count)
 
@@ -223,8 +226,10 @@ class ConcurrentZiplineTest {
       val ex = assertFailsWith<Exception> {
         z2.jsEngine.evaluate("testing.app.cash.zipline.testing.callEchoServiceByName('statefulCounter', '')")
       }
-      assertTrue(ex.cause?.message?.contains("no such service") == true ||
-        ex.message!!.contains("no such service"))
+      assertTrue(
+        ex.cause?.message?.contains("no such service") == true ||
+        ex.message!!.contains("no such service"),
+      )
     } finally {
       z1.close()
       z2.close()

@@ -57,6 +57,14 @@ dependencies {
 // the CDP test sources and their Ktor client dependencies.
 val hermesProd = providers.gradleProperty("hermesProd").orNull?.toBooleanStrictOrNull() ?: true
 
+/** The buildHermesHost* task producing the libhermesvm that [target] binaries link, if any. */
+fun hermesHostBuildTaskName(target: KonanTarget): String? = when (target) {
+  KonanTarget.MACOS_ARM64 -> "buildHermesHostMacosArm64"
+  KonanTarget.MACOS_X64 -> "buildHermesHostMacosX86_64"
+  KonanTarget.LINUX_X64 -> "buildHermesHostLinuxX64"
+  else -> null
+}
+
 kotlin {
   androidTarget {
     // Substitute release AAR with debug AAR when the
@@ -269,6 +277,10 @@ kotlin {
             // Let the loader find libhermesvm.dylib at test/executable runtime.
             "-rpath", "${rootDir}/zipline/build/hermes-jni/$hermesHostLibDir",
           )
+        }
+        // Link against a freshly built host library rather than whatever is (or isn't) on disk.
+        hermesHostBuildTaskName(konanTarget)?.let { taskName ->
+          linkTaskProvider.configure { dependsOn(taskName) }
         }
       }
 

@@ -12,6 +12,7 @@ import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.readUTF8LineTo
 import io.ktor.utils.io.writeStringUtf8
 import io.ktor.websocket.RawWebSocket
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -19,7 +20,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okio.ByteString.Companion.toByteString
-import kotlin.coroutines.coroutineContext
 
 /**
  * The CDP debug server for all platforms: ktor-network sockets on loopback
@@ -175,5 +175,4 @@ private class KtorNetworkCdpServer(
   }
 }
 
-internal fun initCdpServer(port: Int, core: CdpDebugServer): CdpServerHandle =
-  KtorNetworkCdpServer(port, core)
+internal fun initCdpServer(port: Int, core: CdpDebugServer): CdpServerHandle = KtorNetworkCdpServer(port, core)

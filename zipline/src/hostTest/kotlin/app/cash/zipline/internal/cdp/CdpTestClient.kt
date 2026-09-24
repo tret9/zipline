@@ -42,7 +42,6 @@ internal class CdpTestClient private constructor(
 
   suspend fun awaitEventContaining(marker: String): String = awaitMessage(marker)
 
-  /** Awaits a message containing [marker] (and [andAlso] when given). */
   /** The next raw frame, or null after [timeoutMs] without one. */
   suspend fun nextEvent(timeoutMs: Long = Long.MAX_VALUE): String? {
     if (stash.isNotEmpty()) return stash.removeAt(0)
@@ -57,6 +56,7 @@ internal class CdpTestClient private constructor(
 
   private val stash = mutableListOf<String>()
 
+  /** Awaits a message containing [marker] (and [andAlso] when given). */
   suspend fun awaitMessage(marker: String, andAlso: String? = null): String {
     fun String.matches() = contains(marker) && (andAlso == null || contains(andAlso))
     stash.indexOfFirst { it.matches() }.let { index ->

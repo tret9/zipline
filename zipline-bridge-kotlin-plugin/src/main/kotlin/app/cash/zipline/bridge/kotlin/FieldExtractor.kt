@@ -83,8 +83,7 @@ private fun extractField(property: IrProperty, primaryConstructorParamNames: Set
   )
 }
 
-private fun IrProperty.hasBackingField(): Boolean =
-    backingField != null ||
+private fun IrProperty.hasBackingField(): Boolean = backingField != null ||
       //  TODO(gogabr): should I also check for `isFakeOverride`?
     overriddenSymbols.singleOrNull { !it.owner.parentAsClass.isInterface }?.owner?.hasBackingField() == true
 
@@ -127,8 +126,6 @@ internal fun jniFieldDescriptor(ktType: String): String {
   return "L${jvmFqName.replace('.', '/')};"
 }
 
-internal fun isJniPrimitive(ktType: String): Boolean =
-  kotlinToJniFieldType[ktType]?.let { it.length == 1 } ?: false
+internal fun isJniPrimitive(ktType: String): Boolean = kotlinToJniFieldType[ktType]?.let { it.length == 1 } ?: false
 
-internal fun isKnownType(ktType: String): Boolean =
-  ktType in kotlinToJniFieldType
+internal fun isKnownType(ktType: String): Boolean = ktType in kotlinToJniFieldType

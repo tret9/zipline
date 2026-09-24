@@ -2,10 +2,11 @@ package androidx.collection.manual
 
 import androidx.collection.CircularArray
 
+private const val ELEMENT_X = "x"
+private const val ELEMENT_Y = "y"
+private const val ELEMENT_Z = "z"
+
 class CircularArrayTest : Tests {
-    private val ELEMENT_X = "x"
-    private val ELEMENT_Y = "y"
-    private val ELEMENT_Z = "z"
 
     override fun tests(): List<Pair<String, () -> Unit>> = listOf(
         "creatingWithZeroCapacity" to { creatingWithZeroCapacity() },
@@ -14,7 +15,7 @@ class CircularArrayTest : Tests {
         "overpoppingFromStart" to { overpoppingFromStart() },
         "overpoppingFromEnd" to { overpoppingFromEnd() },
         "removeFromEitherEnd" to { removeFromEitherEnd() },
-        "overremovalFromStart" to { overremovalFromStart() }
+        "overremovalFromStart" to { overremovalFromStart() },
     )
 
     private fun creatingWithZeroCapacity() {

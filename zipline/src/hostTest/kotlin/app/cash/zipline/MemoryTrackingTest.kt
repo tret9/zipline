@@ -99,7 +99,7 @@ class MemoryTrackingTest {
       "memoryTracking: warmup=$warmup iterations=$iterations" +
         " heapBaseline=$heapBaseline heapFinal=$heapFinal" +
         " rssBaseline=$rssBaseline rssFinal=$rssFinal" +
-        " samples(heap,rss)=$samples"
+        " samples(heap,rss)=$samples",
     )
 
     if (heapBaseline >= 0) {

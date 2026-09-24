@@ -7,7 +7,7 @@ buildscript {
     google()
   }
   dependencies {
-    classpath("app.cash.zipline:zipline-gradle-plugin:${project.property("ziplineVersion")}")
+    classpath("io.github.tret9:zipline-gradle-plugin:${project.property("ziplineVersion")}")
     classpath(libs.android.gradle.plugin)
     classpath(libs.kotlin.gradle.plugin)
   }

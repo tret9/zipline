@@ -1,9 +1,9 @@
 package androidx.collection.manual
 
 import androidx.collection.MutableIntObjectMap
-import androidx.collection.mutableIntObjectMapOf
 import androidx.collection.emptyIntObjectMap
 import androidx.collection.intObjectMapOf
+import androidx.collection.mutableIntObjectMapOf
 
 class IntObjectMapTest : Tests {
     override fun tests(): List<Pair<String, () -> Unit>> = listOf(
@@ -19,7 +19,7 @@ class IntObjectMapTest : Tests {
         "clear" to { clear() },
         "containsKey" to { containsKey() },
         "containsValue" to { containsValue() },
-        "size" to { size() }
+        "size" to { size() },
     )
 
     private fun intObjectMap() {

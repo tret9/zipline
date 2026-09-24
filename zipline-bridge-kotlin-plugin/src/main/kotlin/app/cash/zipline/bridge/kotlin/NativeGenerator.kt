@@ -1,5 +1,6 @@
 package app.cash.zipline.bridge.kotlin
 
+import java.io.File
 import org.jetbrains.kotlin.descriptors.ClassKind
 import org.jetbrains.kotlin.ir.declarations.IrClass
 import org.jetbrains.kotlin.ir.types.IrSimpleType
@@ -10,7 +11,6 @@ import org.jetbrains.kotlin.ir.types.isMarkedNullable
 import org.jetbrains.kotlin.ir.util.fqNameWhenAvailable
 import org.jetbrains.kotlin.ir.util.hasAnnotation
 import org.jetbrains.kotlin.name.FqName
-import java.io.File
 
 // -- Kotlin/Native bridge code generation (iOS) --
 // Hermes rewrite: uses COpaquePointer? (context) + Int (handle) instead of
@@ -23,8 +23,10 @@ private val REDWOOD_CODEGEN_API_FQN = FqName("app.cash.redwood.RedwoodCodegenApi
 // -- Recursive JS → Kotlin collection conversion (List/Array/Map, incl. nested) --
 
 private val MAP_KOTLIN_TYPES = setOf(
-  "kotlin.collections.Map", "kotlin.collections.MutableMap",
-  "kotlin.collections.HashMap", "kotlin.collections.LinkedHashMap",
+  "kotlin.collections.Map",
+  "kotlin.collections.MutableMap",
+  "kotlin.collections.HashMap",
+  "kotlin.collections.LinkedHashMap",
 )
 
 /** Primitive arrays supported by the generators. */
@@ -79,21 +81,26 @@ private fun collectRuntimeImports(
   }
   when {
     ktType == "kotlin.Any" -> needsBridgeForAny.add(Unit)
+
     ktType == "kotlin.Long" -> needsJsLong.add(Unit)
+
     ktType in MAP_KOTLIN_TYPES -> {
       (type as? IrSimpleType)?.arguments?.forEach { arg ->
         collectRuntimeImports((arg as? IrTypeProjection)?.type ?: (arg as? IrType), needsBridgeForAny, needsJsLong)
       }
     }
+
     ktType == "kotlin.collections.List" || ktType == "kotlin.Array" -> {
       needsBridgeForAny.add(Unit)
       (type as? IrSimpleType)?.arguments?.forEach { arg ->
         collectRuntimeImports((arg as? IrTypeProjection)?.type ?: (arg as? IrType), needsBridgeForAny, needsJsLong)
       }
     }
+
     ktType in PRIMITIVE_ARRAY_ELEMENT_TYPE -> {
       if (PRIMITIVE_ARRAY_ELEMENT_TYPE[ktType] == "kotlin.Long") needsJsLong.add(Unit)
     }
+
     else -> needsBridgeForAny.add(Unit)
   }
 }
@@ -181,8 +188,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
       val propName = field.jsPropertyName
 
       // Helpers to emit the common Hermes read/free preamble/suffix.
-      fun readProperty(): String =
-        "val ${field.name}Ref = HermesBridge_createHandle(ctx, jsValHandle, \"$propName\")"
+      fun readProperty(): String = "val ${field.name}Ref = HermesBridge_createHandle(ctx, jsValHandle, \"$propName\")"
       fun freeRef(): String = "HermesBridge_freeHandle(ctx, ${field.name}Ref)"
 
       when {
@@ -196,6 +202,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.isInline && field.underlyingKtType == "kotlin.Float" -> {
           appendLine("    ${readProperty()}")
           if (field.isNullable) {
@@ -206,6 +213,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.isInline && field.underlyingKtType == "kotlin.Double" -> {
           appendLine("    ${readProperty()}")
           if (field.isNullable) {
@@ -216,6 +224,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.isInline && field.underlyingKtType == "kotlin.Long" -> {
           appendLine("    ${readProperty()}")
           if (field.isNullable) {
@@ -226,6 +235,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.effectiveKtType == "kotlin.Int" -> {
           appendLine("    ${readProperty()}")
           if (field.isNullable) {
@@ -235,6 +245,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.effectiveKtType == "kotlin.Boolean" -> {
           appendLine("    ${readProperty()}")
           if (field.isNullable) {
@@ -244,6 +255,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.effectiveKtType == "kotlin.Double" -> {
           appendLine("    ${readProperty()}")
           if (field.isNullable) {
@@ -253,6 +265,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.effectiveKtType == "kotlin.Float" -> {
           appendLine("    ${readProperty()}")
           if (field.isNullable) {
@@ -262,6 +275,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.effectiveKtType == "kotlin.Long" -> {
           appendLine("    ${readProperty()}")
           if (field.isNullable) {
@@ -271,6 +285,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.effectiveKtType == "kotlin.String" -> {
           appendLine("    ${readProperty()}")
           appendLine("    val ${field.name}Str = HermesBridge_getValueString(ctx, ${field.name}Ref)")
@@ -281,6 +296,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.effectiveKtType in MAP_KOTLIN_TYPES -> {
           val keyType = typeArgument(field.type, 0)
           val valueType = typeArgument(field.type, 1)
@@ -315,6 +331,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           appendLine("    }")
           appendLine("    ${freeRef()}")
         }
+
         field.effectiveKtType == "kotlin.collections.List" -> {
           val renderedElement = renderedTypeName(field.arrayElementIrType)
           appendLine("    val ${field.name}Ref = HermesBridge_createHandle(ctx, jsValHandle, \"$propName\")")
@@ -333,6 +350,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    HermesBridge_freeHandle(ctx, ${field.name}ArrRef)")
         }
+
         field.effectiveKtType in PRIMITIVE_ARRAY_ELEMENT_TYPE -> {
           val arrayType = field.effectiveKtType.substringAfterLast(".")
           appendLine("    val ${field.name}Ref = HermesBridge_createHandle(ctx, jsValHandle, \"$propName\")")
@@ -344,6 +362,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.effectiveKtType == "kotlin.Array" -> {
           val renderedElement = renderedTypeName(field.arrayElementIrType)
           appendLine("    val ${field.name}Ref = HermesBridge_createHandle(ctx, jsValHandle, \"$propName\")")
@@ -355,6 +374,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.isObjectType && field.ktType != "kotlin.Any" -> {
           val typeName = field.ktType.substringAfterLast(".")
           appendLine("    val ${field.name}Ref = HermesBridge_createHandle(ctx, jsValHandle, \"$propName\")")
@@ -373,6 +393,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         field.ktType == "kotlin.Any" -> {
           appendLine("    val ${field.name}Ref = HermesBridge_createHandle(ctx, jsValHandle, \"$propName\")")
           if (field.isNullable) {
@@ -382,6 +403,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
           }
           appendLine("    ${freeRef()}")
         }
+
         else -> {
           appendLine("    val ${field.name}Ref = HermesBridge_createHandle(ctx, jsValHandle, \"$propName\")")
           appendLine("    // TODO: unsupported type ${field.ktType} (isObjectType=${field.isObjectType}, isInline=${field.isInline})")
@@ -425,7 +447,7 @@ internal fun generateNativeBridgeFile(outputDir: String, clazz: IrClass) {
     appendLine()
     appendLine("@OptIn(kotlin.ExperimentalStdlibApi::class)")
     appendLine("@kotlin.native.EagerInitialization")
-    appendLine("private val _bridgeInit_${functionName} = run {")
+    appendLine("private val _bridgeInit_$functionName = run {")
     appendLine("    registerBridge(\"$fqn\", staticCFunction(::$functionName))")
     appendLine("    Unit")
     appendLine("}")
@@ -602,20 +624,35 @@ private fun emitElementConversion(
 
   return when {
     ktType == "kotlin.String" -> "HermesBridge_getValueString(ctx, $expr)?.let { s -> s.toKStringFromUtf8()?.also { platform.posix.free(s) } } ?: \"\""
+
     isInlineElem && underlying == "kotlin.Int" -> "${ktType.substringAfterLast(".")}(HermesBridge_getValueDouble(ctx, $expr).toInt())"
+
     isInlineElem && underlying == "kotlin.Double" -> "${ktType.substringAfterLast(".")}(HermesBridge_getValueDouble(ctx, $expr))"
+
     isInlineElem && underlying == "kotlin.Long" -> "${ktType.substringAfterLast(".")}(JsNumberToLong(ctx, $expr))"
+
     isInlineElem && underlying == "kotlin.Float" -> "${ktType.substringAfterLast(".")}(HermesBridge_getValueDouble(ctx, $expr).toFloat())"
+
     ktType == "kotlin.Int" -> "HermesBridge_getValueDouble(ctx, $expr).toInt()"
+
     ktType == "kotlin.Long" -> "JsNumberToLong(ctx, $expr)"
+
     ktType == "kotlin.Float" -> "HermesBridge_getValueDouble(ctx, $expr).toFloat()"
+
     ktType == "kotlin.Double" -> "HermesBridge_getValueDouble(ctx, $expr)"
+
     ktType == "kotlin.Boolean" -> "(HermesBridge_getValueBool(ctx, $expr) != 0)"
+
     ktType == "kotlin.Any" -> "bridgeForAny(ctx, $expr) as Any"
+
     ktType == "kotlin.collections.List" -> emitListHelper(helpers, name, typeArgument(type, 0), ctx, expr)
+
     ktType == "kotlin.Array" -> emitArrayHelper(helpers, name, typeArgument(type, 0), ctx, expr)
+
     ktType in MAP_KOTLIN_TYPES -> emitMapHelper(helpers, name, type, ctx, expr)
+
     ktType in PRIMITIVE_ARRAY_ELEMENT_TYPE -> emitPrimitiveArrayHelper(helpers, name, ktType, ctx, expr)
+
     else -> {
       // Object element: use bridge dispatch.
       val typeName = ktType.substringAfterLast(".")

@@ -213,5 +213,4 @@ class BridgeEndToEndTest {
     }
     assertEquals(mapOf("outer" to listOf(mapOf(1.0 to "one", 2.0 to "two"))), complexNested)
   }
-
 }

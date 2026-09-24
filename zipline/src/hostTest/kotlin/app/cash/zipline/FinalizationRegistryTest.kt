@@ -16,8 +16,8 @@
 package app.cash.zipline
 
 import kotlin.test.AfterTest
-import kotlin.test.Ignore
 import kotlin.test.BeforeTest
+import kotlin.test.Ignore
 import kotlin.test.Test
 import kotlin.test.assertEquals
 

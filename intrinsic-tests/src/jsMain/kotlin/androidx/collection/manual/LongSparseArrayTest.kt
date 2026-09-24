@@ -14,7 +14,7 @@ class LongSparseArrayTest : Tests {
         "putIfAbsentReturnsNullWhenAbsent" to { putIfAbsentReturnsNullWhenAbsent() },
         "replaceWhenAbsentDoesNotStore" to { replaceWhenAbsentDoesNotStore() },
         "replaceStoresAndReturnsOldValue" to { replaceStoresAndReturnsOldValue() },
-        "replaceStoresAndReturnsNullWhenMappedToNull" to { replaceStoresAndReturnsNullWhenMappedToNull() }
+        "replaceStoresAndReturnsNullWhenMappedToNull" to { replaceStoresAndReturnsNullWhenMappedToNull() },
     )
 
     private fun getOrDefaultPrefersStoredValue() {

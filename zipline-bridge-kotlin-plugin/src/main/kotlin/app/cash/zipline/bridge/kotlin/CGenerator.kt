@@ -1,28 +1,26 @@
 package app.cash.zipline.bridge.kotlin
 
+import java.io.File
+import org.jetbrains.kotlin.descriptors.ClassKind
 import org.jetbrains.kotlin.ir.declarations.IrClass
-import org.jetbrains.kotlin.ir.types.IrSimpleType
-import org.jetbrains.kotlin.ir.types.IrType
-import org.jetbrains.kotlin.ir.types.getClass
-import org.jetbrains.kotlin.ir.types.classFqName
-import org.jetbrains.kotlin.ir.util.fqNameWhenAvailable
-import org.jetbrains.kotlin.ir.util.properties
 import org.jetbrains.kotlin.ir.declarations.IrConstructor
 import org.jetbrains.kotlin.ir.declarations.IrDeclarationParent
 import org.jetbrains.kotlin.ir.declarations.IrParameterKind
-import org.jetbrains.kotlin.descriptors.ClassKind
+import org.jetbrains.kotlin.ir.types.IrSimpleType
+import org.jetbrains.kotlin.ir.types.IrType
+import org.jetbrains.kotlin.ir.types.classFqName
+import org.jetbrains.kotlin.ir.types.getClass
+import org.jetbrains.kotlin.ir.util.fqNameWhenAvailable
+import org.jetbrains.kotlin.ir.util.properties
 import org.jetbrains.kotlin.name.FqName
-import java.io.File
 
 // -- C file naming and JNI class name helpers --
 
 internal const val KEEP_NAMES_FILE = "bridge-keep-names.txt"
 
-internal fun cFunctionPrefix(fqName: FqName): String =
-  fqName.asString().replace(".", "_")
+internal fun cFunctionPrefix(fqName: FqName): String = fqName.asString().replace(".", "_")
 
-internal fun cFileName(fqName: FqName): String =
-  cFunctionPrefix(fqName) + ".cpp"
+internal fun cFileName(fqName: FqName): String = cFunctionPrefix(fqName) + ".cpp"
 
 internal fun buildJniClassName(irClass: IrClass): String {
   val fqName = irClass.fqNameWhenAvailable?.asString() ?: return irClass.name.asString()
@@ -48,8 +46,10 @@ internal fun buildJniClassName(irClass: IrClass): String {
 
 /** Map types recognized by the C converter (mirrors the native generator). */
 private val MAP_C_TYPES = setOf(
-  "kotlin.collections.Map", "kotlin.collections.MutableMap",
-  "kotlin.collections.HashMap", "kotlin.collections.LinkedHashMap",
+  "kotlin.collections.Map",
+  "kotlin.collections.MutableMap",
+  "kotlin.collections.HashMap",
+  "kotlin.collections.LinkedHashMap",
 )
 
 internal fun generateBridgeFile(outputDir: String, annotatedClass: IrClass) {
@@ -70,8 +70,11 @@ internal fun generateBridgeFile(outputDir: String, annotatedClass: IrClass) {
   val isObject = annotatedClass.kind == ClassKind.OBJECT
   val isCompanion = isObject && annotatedClass.isCompanion
   val isEnum = annotatedClass.kind == ClassKind.ENUM_CLASS
-  val constructorSig = if (isObject || constructorFields.isEmpty()) "()V"
-    else "(" + constructorFields.joinToString("") { it.jniTypeChar } + ")V"
+  val constructorSig = if (isObject || constructorFields.isEmpty()) {
+    "()V"
+  } else {
+    "(" + constructorFields.joinToString("") { it.jniTypeChar } + ")V"
+  }
   val instanceSig = if (isObject) "L${jniClassName.replace(".", "/")};" else ""
 
   val cSource = buildString {
@@ -268,7 +271,7 @@ internal fun generateBridgeFile(outputDir: String, annotatedClass: IrClass) {
       if (fields.isNotEmpty()) {
         appendLine("    // Extract field values from JS object")
       }
-  
+
       // Extract each field from the JS object
       for (field in fields) {
         val nullablePrimitive = field.isNullable && isKnownType(field.ktType) && isJniPrimitive(field.ktType)
@@ -278,10 +281,13 @@ internal fun generateBridgeFile(outputDir: String, annotatedClass: IrClass) {
           field.effectiveKtType == "kotlin.collections.List" ||
           field.effectiveKtType == "kotlin.collections.MutableList" ||
           field.effectiveKtType in MAP_C_TYPES
-        val cType = if (nullablePrimitive || isCollectionField) "jobject"
-          else kotlinToCType[field.effectiveKtType] ?: "jobject"
+        val cType = if (nullablePrimitive || isCollectionField) {
+          "jobject"
+        } else {
+          kotlinToCType[field.effectiveKtType] ?: "jobject"
+        }
         val javaVar = "java_${field.name}"
-  
+
         appendLine("    jsi::Value js_${field.name} = jsObj.asObject(rt).getProperty(rt, \"${field.jsPropertyName}\");")
         // For Long-backed inline classes (e.g. Color), the JS object may be unboxed —
         // *jsObj IS the Long {low_1, high_1} with no .value wrapper. If .value is
@@ -303,28 +309,33 @@ internal fun generateBridgeFile(outputDir: String, annotatedClass: IrClass) {
         }
         appendLine("    $cType $javaVar;")
         appendLine("    {")
-  
+
         // Open null check for nullable fields
         if (field.isNullable) {
           appendLine("        if (!js_${field.name}.isUndefined() && !js_${field.name}.isNull()) {")
         }
-  
+
         when {
           field.isNullable && isKnownType(field.ktType) && isJniPrimitive(field.ktType) -> {
             emitNullablePrimitiveExtraction(this, field)
           }
+
           field.effectiveKtType == "kotlin.Boolean" -> {
             appendLine("        $javaVar = (jboolean)js_${field.name}.asBool();")
           }
+
           field.effectiveKtType == "kotlin.Byte" -> {
             appendLine("        $javaVar = (jbyte)jsi_value_get_int(js_${field.name});")
           }
+
           field.effectiveKtType == "kotlin.Short" -> {
             appendLine("        $javaVar = (jshort)jsi_value_get_int(js_${field.name});")
           }
+
           field.effectiveKtType == "kotlin.Int" -> {
             appendLine("        $javaVar = (jint)jsi_value_get_int(js_${field.name});")
           }
+
           field.effectiveKtType == "kotlin.Long" -> {
             appendLine("        int tag_${field.name} = jsi_value_tag(rt, js_${field.name});")
             appendLine("        if (tag_${field.name} == JS_TAG_FLOAT64) {")
@@ -345,6 +356,7 @@ internal fun generateBridgeFile(outputDir: String, annotatedClass: IrClass) {
             appendLine("            $javaVar = 0;")
             appendLine("        }")
           }
+
           field.effectiveKtType == "kotlin.Float" || field.effectiveKtType == "kotlin.Double" -> {
             val cast = if (field.effectiveKtType == "kotlin.Float") "(jfloat)" else "(jdouble)"
             appendLine("        int tag_${field.name}_d = jsi_value_tag(rt, js_${field.name});")
@@ -360,26 +372,32 @@ internal fun generateBridgeFile(outputDir: String, annotatedClass: IrClass) {
             appendLine("            $javaVar = 0;")
             appendLine("        }")
           }
+
           field.effectiveKtType == "kotlin.Char" -> {
             appendLine("        $javaVar = (jchar)jsi_value_get_int(js_${field.name});")
           }
+
           field.effectiveKtType == "kotlin.String" -> {
             appendLine("        std::string str_${field.name} = js_${field.name}.asString(rt).utf8(rt);")
             appendLine("        $javaVar = env->NewStringUTF(str_${field.name}.c_str());")
           }
+
           field.effectiveKtType in MAP_C_TYPES ||
             field.effectiveKtType == "kotlin.collections.List" ||
             field.effectiveKtType == "kotlin.collections.MutableList" ||
             field.isArray -> {
             appendLine("        $javaVar = conv_${field.name}(env, rt, js_${field.name});")
           }
+
           field.effectiveKtType == "kotlin.Any" -> {
             emitAnyFieldExtraction(this, field)
           }
+
           field.isInline && field.isNullable -> {
             val inlineCPrefix = cFunctionPrefix(FqName(field.ktType))
             appendLine("        $javaVar = ${inlineCPrefix}_fromValue(env, rt, js_${field.name});")
           }
+
           field.isObjectType -> {
             appendLine("        // Look up bridge_dispatch on the sub-object to convert it.")
             appendLine("        intptr_t _bridge_ptr_${field.name} = jsi_get_bridge_dispatch(rt, js_${field.name});")
@@ -399,18 +417,18 @@ internal fun generateBridgeFile(outputDir: String, annotatedClass: IrClass) {
             appendLine("        $javaVar = disp_${field.name}->toJavaObject(env, rt, js_${field.name});")
           }
         }
-  
+
         // Close null check for nullable fields
         if (field.isNullable) {
           appendLine("        } else {")
           appendLine("            $javaVar = NULL;")
           appendLine("        }")
         }
-  
+
         appendLine("    }")
         appendLine()
       }
-  
+
       // Create instance using cached class/constructor/field refs.
       appendLine("    // Create instance using cached JNI references")
       if (isCompanion) {
@@ -427,7 +445,7 @@ internal fun generateBridgeFile(outputDir: String, annotatedClass: IrClass) {
       }
       appendLine("    if (env->ExceptionCheck()) return NULL;")
       appendLine()
-  
+
       // Set body fields using cached field IDs
       if (!isEnum && bodyFields.isNotEmpty()) {
         appendLine("    // Set non-constructor fields")
@@ -443,7 +461,7 @@ internal fun generateBridgeFile(outputDir: String, annotatedClass: IrClass) {
         }
         appendLine()
       }
-  
+
       appendLine("    return result;")
       appendLine("}")
     } // end else (non-enum)
@@ -540,13 +558,21 @@ private fun emitCValueConverter(
       )
       helpers.appendLine()
     }
+
     "kotlin.Int" -> emitCBoxedConverter(helpers, name, "java/lang/Integer", "(I)V", "jsi_value_get_int(jsVal)")
+
     "kotlin.Float" -> emitCBoxedConverter(helpers, name, "java/lang/Float", "(F)V", "jsi_value_get_float64(jsVal)")
+
     "kotlin.Double" -> emitCBoxedConverter(helpers, name, "java/lang/Double", "(D)V", "jsi_value_get_float64(jsVal)")
+
     "kotlin.Boolean" -> emitCBoxedConverter(helpers, name, "java/lang/Boolean", "(Z)V", "jsi_value_get_bool(jsVal)")
+
     "kotlin.Byte" -> emitCBoxedConverter(helpers, name, "java/lang/Byte", "(B)V", "(jbyte)jsi_value_get_int(jsVal)")
+
     "kotlin.Short" -> emitCBoxedConverter(helpers, name, "java/lang/Short", "(S)V", "(jshort)jsi_value_get_int(jsVal)")
+
     "kotlin.Char" -> emitCBoxedConverter(helpers, name, "java/lang/Character", "(C)V", "(jchar)jsi_value_get_int(jsVal)")
+
     "kotlin.Long" -> {
       helpers.appendLine(
         """
@@ -557,6 +583,7 @@ private fun emitCValueConverter(
       )
       helpers.appendLine()
     }
+
     "kotlin.Any" -> {
       helpers.appendLine(
         """
@@ -567,6 +594,7 @@ private fun emitCValueConverter(
       )
       helpers.appendLine()
     }
+
     "kotlin.collections.List" -> {
       val elementType = typeArgument(irType, 0)
       val elementKtType = effectiveClassFqn(elementType)
@@ -600,6 +628,7 @@ private fun emitCValueConverter(
       )
       helpers.appendLine()
     }
+
     "kotlin.Array" -> {
       val elementType = typeArgument(irType, 0)
       val elementKtType = effectiveClassFqn(elementType)
@@ -626,6 +655,7 @@ private fun emitCValueConverter(
       )
       helpers.appendLine()
     }
+
     in MAP_C_TYPES -> {
       val keyType = typeArgument(irType, 0)
       val valueType = typeArgument(irType, 1)
@@ -674,6 +704,7 @@ private fun emitCValueConverter(
       )
       helpers.appendLine()
     }
+
     in PRIMITIVE_ARRAY_ELEMENT_TYPE -> {
       val arrayType = kotlinToCType[ktType]!!
       val info = primitiveArrayJniInfo[ktType]!!
@@ -697,6 +728,7 @@ private fun emitCValueConverter(
       )
       helpers.appendLine()
     }
+
     else -> {
       helpers.appendLine(
         """
@@ -736,7 +768,7 @@ internal fun emitNullablePrimitiveExtraction(
     sb.appendLine("            $javaVar = env->NewObject(_boxed_${field.name}, _boxedCtor_${field.name}, longVal);")
   } else {
     sb.appendLine(
-      "            $javaVar = env->NewObject(_boxed_${field.name}, _boxedCtor_${field.name}, ${info.jsCast}${info.jsGetter}(js_${field.name}));"
+      "            $javaVar = env->NewObject(_boxed_${field.name}, _boxedCtor_${field.name}, ${info.jsCast}${info.jsGetter}(js_${field.name}));",
     )
   }
 }
@@ -794,4 +826,3 @@ internal fun generateKeepNames(outputDir: String, annotatedClasses: List<IrClass
 }
 
 // -- field extraction --
-
