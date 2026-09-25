@@ -136,9 +136,10 @@ jobs:
 
       - uses: ./.github/actions/setup-build
 
-      # x64 Apple targets are skipped: this runner is arm64. --continue reports every failing
-      # module in one run. -PhermesProd=false: the lean Apple engine can't compile JS source, which
-      # the tests do.
+      # x64 Apple targets are skipped: this runner is arm64. tvOS is skipped: there is no tvOS
+      # Hermes build, so tvOS test binaries can't link. --continue reports every failing module in
+      # one run. -PhermesProd=false: the lean Apple engine can't compile JS source, which the tests
+      # do.
       - run: >
           ./gradlew
           --continue
@@ -149,6 +150,9 @@ jobs:
           -x iosX64Test
           -x macosX64Test
           -x tvosX64Test
+          -x tvosX64ReleaseTest
+          -x tvosSimulatorArm64Test
+          -x tvosSimulatorArm64ReleaseTest
 
       - uses: actions/upload-artifact@v7
         if: ${{ failure() }}
