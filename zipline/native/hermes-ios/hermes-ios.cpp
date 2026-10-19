@@ -10,6 +10,7 @@
 #include <string.h>
 #include <cmath>
 
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -1029,6 +1030,9 @@ static std::vector<std::pair<std::string, void*>> g_iosBridgeTable;
 static std::mutex g_iosBridgeMutex;
 
 void HermesBridge_addBridgeEntry(const char* fqn, void* fn) {
+    // TEMP-TEST-THROW remove before merge
+    // It's impossible to catch c++ exceptions in JNI without try-catch in c++ :(
+    // throw std::runtime_error("TEMP-TEST-THROW HermesBridge_addBridgeEntry");
     std::lock_guard<std::mutex> lock(g_iosBridgeMutex);
     g_iosBridgeTable.push_back({fqn, fn});
 }
@@ -1053,6 +1057,9 @@ jsi::Value* bridgeHandleValue(ContextNative* ctx, int handle) {
 } // namespace
 
 void HermesBridge_installBridgeRegister(void* jsiRuntime) {
+    // TEMP-TEST-THROW remove before merge
+    // It's impossible to catch c++ exceptions in K/N without try-catch in c++ :(
+    // throw std::runtime_error("TEMP-TEST-THROW HermesBridge_installBridgeRegister");
     if (!jsiRuntime) return;
     jsi::Runtime& rt = *static_cast<jsi::Runtime*>(jsiRuntime);
 
