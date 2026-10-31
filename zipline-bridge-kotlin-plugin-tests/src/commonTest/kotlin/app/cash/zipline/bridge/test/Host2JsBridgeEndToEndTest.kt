@@ -267,6 +267,11 @@ class Host2JsBridgeEndToEndTest {
   }
 
   @Test
+  fun containersRoundTrip() {
+    assertEquals(BridgedTestValues.containers, host.roundTrip(BridgedTestValues.containers))
+  }
+
+  @Test
   fun guestSeesTheConvertedFields() {
     // The guest's own view of a converted value: JSON.stringify shows the field names the guest
     // will read (stable @JsName properties), with the host's values in them.
@@ -309,12 +314,15 @@ class Host2JsBridgeEndToEndTest {
   @Test
   fun callGuestFunctionUnbridgedArgThrows() {
     host.evaluateForBridge("globalThis.__testSink = function (a) { return 'unreachable'; }; 0")
-    // The JVM surfaces the missing convertToJs member as a NoSuchMethodError, Kotlin/Native an
-    // IllegalStateException; both name the offending argument class.
-    val e = assertFailsWith<Throwable> {
+    // The last-resort path for a host value with no bridge: name the class and both possible
+    // causes, instead of a bare NoSuchMethodError (JVM) or "no bridge" (Kotlin/Native). The
+    // native engine wraps the host error in JsException, so assert the common supertype.
+    val e = assertFailsWith<RuntimeException> {
       host.callGuestFunction("__testSink", listOf(NotBridged("nope")))
     }
-    assertEquals(true, e.message!!.contains("NotBridged"), "message was: " + e.message)
+    val message = e.message ?: ""
+    assertTrue(message.contains("NotBridged"), "message was: $message")
+    assertTrue(message.contains("no bridge for"), "message was: $message")
   }
 
   @Test
@@ -395,12 +403,9 @@ class Host2JsBridgeEndToEndTest {
       val e = assertFailsWith<IllegalStateException> {
         host.callGuestFunction("__provideNotBridgedGuest", emptyList())
       }
-      assertEquals(true, e.message!!.contains("NotBridgedGuest"), "message was: " + e.message)
-      assertEquals(
-        true,
-        e.message!!.contains("no converter registered"),
-        "message was: " + e.message,
-      )
+      val message = e.message ?: ""
+      assertTrue(message.contains("NotBridgedGuest"), "message was: $message")
+      assertTrue(message.contains("no converter registered"), "message was: $message")
     } finally {
       host.evaluateForBridge("delete globalThis.__provideNotBridgedGuest")
     }
