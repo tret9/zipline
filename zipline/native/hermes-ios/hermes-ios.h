@@ -162,6 +162,12 @@ const char* Hermes_getVersion(void);
 // Error handling
 const char* HermesContext_getLastError(void* context);
 
+// Record a host-side error message on the context without throwing. Used by
+// Kotlin/Native callbacks that catch a Kotlin exception: the C++ host-function
+// lambda reads it back and re-raises as a jsi::JSError, so the message
+// survives the C boundary instead of collapsing to "<unknown>".
+void HermesContext_setHostError(void* context, const char* message);
+
 // -- Bridge Handle Management (for Kotlin/Native generated bridge code) --
 // Tag constants for HermesBridge_getValueTag. Must stay in sync with
 // the NativeGenerator Kotlin code.
@@ -239,6 +245,11 @@ int HermesBridge_newObjectWithPrototype(void* context, const char* fq);
  *  configurable) with the value at [valueHandle]. Defining - not assigning - shadows any
  *  getter-only accessor the class prototype carries. */
 void HermesBridge_defineProperty(void* context, int objHandle, const char* name, int valueHandle);
+
+/** Create a plain `{}` object handle (no prototype beyond Object.prototype). Used as the
+ *  carrier of host-owned fields passed to the guest's create-factory; the guest reads it
+ *  with `key in target` / `target[key]`, so it must NOT carry a class prototype. */
+int HermesBridge_newPlainObject(void* context);
 
 int HermesBridge_createInt(void* context, int value);
 int HermesBridge_createDouble(void* context, double value);
