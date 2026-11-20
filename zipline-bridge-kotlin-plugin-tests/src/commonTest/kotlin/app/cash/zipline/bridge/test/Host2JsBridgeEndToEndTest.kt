@@ -12,6 +12,7 @@
  */
 package app.cash.zipline.bridge.test
 
+import app.cash.zipline.ZiplineApiMismatchException
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -58,6 +59,39 @@ class Host2JsBridgeEndToEndTest {
   }
 
   private fun roundTrip(value: Any): Any? = host.roundTrip(value)
+
+  /**
+   * A registration that arrives empty has to fail at load, in the host, where nothing can swallow it.
+   * The guest wraps its own `__bridgeRegisterRuntime` call in a tolerant try/catch, so an exception
+   * raised inside the hook is lost -- that is what made the ES-class lowering defect travel from a
+   * detail of plugin IR all the way to a device, and arrive named only as
+   * "the guest provides no create_<fqn>".
+   *
+   * Calling the hook with `undefined` is precisely what a broken construction does: it is how the
+   * app-shaped bundle failed, and the es2015 skew modules fail the same way.
+   */
+  @Test
+  fun theHostRefusesAModuleWhoseRegistrationArrivesEmpty() {
+    assertEquals(BridgedTestValues.data, roundTrip(BridgedTestValues.data))
+
+    val recorded = host.evaluateForBridge(
+      """
+      delete globalThis.__zipline_bridgeFactoriesProblem;
+      __bridgeRegisterRuntime(undefined);
+      typeof globalThis.__zipline_bridgeFactoriesProblem;
+      """,
+    )
+    assertEquals("string", recorded, "the host did not record the bad registration")
+
+    try {
+      val e = assertFailsWith<IllegalStateException> { host.loadGuest() }
+      assertTrue(e.message!!.contains("published unusable host->JS runtime factories"), "was: " + e.message)
+      assertTrue(e.message!!.contains("called with undefined"), "was: " + e.message)
+    } finally {
+      // The record is sticky by design, so clear it: the other rows must not inherit this verdict.
+      host.evaluateForBridge("delete globalThis.__zipline_bridgeFactoriesProblem; 0")
+    }
+  }
 
   @Test
   fun data() {
@@ -111,6 +145,23 @@ class Host2JsBridgeEndToEndTest {
     // wraps a conversion failure in JsException, so assert the behaviour both surfaces: a failure
     // that names the enum.
     val failure = assertFails { roundTrip(BridgedTestValues.enumHolder) }
+    assertTrue(
+      failure.message.orEmpty().contains("is an enum"),
+      "expected the refusal to name the enum, got: ${failure.message}",
+    )
+  }
+
+  @Test
+  fun parameterisedEnumCannotCrossToGuestEither() {
+    // The refusal is on the class kind, not on whether the entries happen to carry data: an enum
+    // with fields is exactly as much a singleton problem as one without, and its fields are what a
+    // host-built lookalike would appear to carry convincingly. Asserted rather than assumed, because
+    // `BridgedEnum` -- the only enum fixture until now -- cannot tell the two cases apart.
+    // CLV-180 is expected to INVERT this test: it exists to record that the host->guest refusal in
+    // `Host2JsGenerator` is keyed on class kind, so it covers parameterised enums as well as plain ones,
+    // and not to argue that refusing is right. When enums can cross that way, this becomes a positive
+    // crossing assertion next to `enumCannotCrossToGuest`'s replacement.
+    val failure = assertFails { roundTrip(BridgedTestValues.sizedHolder) }
     assertTrue(
       failure.message.orEmpty().contains("is an enum"),
       "expected the refusal to name the enum, got: ${failure.message}",
@@ -400,7 +451,7 @@ class Host2JsBridgeEndToEndTest {
         "}; 0",
     )
     try {
-      val e = assertFailsWith<IllegalStateException> {
+      val e = assertFailsWith<ZiplineApiMismatchException> {
         host.callGuestFunction("__provideNotBridgedGuest", emptyList())
       }
       assertEquals(true, e.message!!.contains("NotBridgedGuest"), "message was: " + e.message)
@@ -411,6 +462,34 @@ class Host2JsBridgeEndToEndTest {
       )
     } finally {
       host.evaluateForBridge("delete globalThis.__provideNotBridgedGuest")
+    }
+  }
+
+  /**
+   * A host-side bridge refusal must not poison the host that suffered it. The JNI decoders carried on
+   * constructing Java objects after a Java-side converter had thrown, which HotSpot tolerates and ART
+   * aborts on -- `JNI DETECTED ERROR IN APPLICATION: JNI NewObjectV called with pending exception` --
+   * so the abort was the last word and the cause, which had been named correctly, scrolled past it.
+   * What this pins is the contract the guards preserve: the refusal arrives in Kotlin as itself, and
+   * the next call across the same engine still works.
+   */
+  @Test
+  fun hostBridgeRefusalDoesNotPoisonTheHost() {
+    host.evaluateForBridge(
+      "globalThis.__provideNotBridgedGuest = function () { " +
+        "return require('$GUEST_MODULE').app.cash.zipline.bridge.test.provideNotBridgedGuest(); " +
+        "}; 0",
+    )
+    host.evaluateForBridge("globalThis.__hostStillWorks = function () { return 'alive'; }; 0")
+    try {
+      assertFailsWith<ZiplineApiMismatchException> {
+        host.callGuestFunction("__provideNotBridgedGuest", emptyList())
+      }
+      // The refusal arrived, and it arrived alone: the same engine still answers the next call.
+      assertEquals("alive", host.callGuestFunction("__hostStillWorks", emptyList()))
+    } finally {
+      host.evaluateForBridge("delete globalThis.__provideNotBridgedGuest")
+      host.evaluateForBridge("delete globalThis.__hostStillWorks")
     }
   }
 
@@ -432,5 +511,247 @@ class Host2JsBridgeEndToEndTest {
     } finally {
       unregisteredHost.close()
     }
+  }
+
+  /**
+   * A mutable body field crosses host → guest, and only when the host actually has one.
+   *
+   * The converter emits body `var`s (JSON of the carrier shows `{"a_1":3,"extra_1":"from-host"}`), and
+   * the guest's factory now applies the ones that arrived *after* running the constructor — the guest
+   * constructor owns the initializer an absent field keeps, so the order is not interchangeable.
+   *
+   * This is the shape that made the create-factory a narrowing of the stamped path: stamping defined
+   * every field onto the object, so `extra` crossed without any work, while a constructor-only factory
+   * dropped it silently. Nothing caught it because no bridged class here had a mutable body field —
+   * which is why the fixture stays and the skew pair sits beside it: presence is asserted here,
+   * absence needs a peer that does not declare the field at all.
+   */
+  @Test
+  fun mutableBodyFieldFromHostReachesTheGuest() {
+    val payload = BridgedMutableBody(a = 3).apply {
+      extra = "from-host"
+      tags = listOf("a", "b")
+      w = BridgedInline(9)
+      count = 7
+    }
+    assertEquals("3|from-host|a+b|9|7", host.callGuestFunction("describeMutableBody", listOf(payload)))
+  }
+
+  /**
+   * `Byte`, `Short` and `Char` into the guest. All three are numbers on the wire, so what is being
+   * pinned is not the encoding but the decoding: the receiver has to narrow back to the type the
+   * property declares, and the guest's runtime — which calls them numbers too — cannot be the reason
+   * one host manages it and the other cannot.
+   */
+  @Test
+  fun narrowScalarFieldsReachTheGuest() {
+    val payload = BridgedNarrowHolder(b = 7, s = -9, c = 'z', opt = 'X')
+    assertEquals("7|-9|z|X", host.callGuestFunction("describeNarrowHolder", listOf(payload)))
+  }
+
+  @Test
+  fun narrowScalarFieldsAbsentFromTheGuestSide() {
+    // The nullable one is the interesting case: absent-as-null has to stay distinguishable from the
+    // zero a narrow read answers with, or a missing `Char` would silently become `'\u0000'`.
+    //
+    // `é` rather than an ASCII letter, because the value crosses as a code point and the round trip
+    // through `Int.toChar()` is only tested by a number that is not also a small integer in disguise.
+    val payload = BridgedNarrowHolder(b = -1, s = 2, c = 'é')
+    assertEquals("-1|2|é|-", host.callGuestFunction("describeNarrowHolder", listOf(payload)))
+  }
+
+  /**
+   * Task 5.15, the construction half. A `UByte` field used to make the Kotlin/Native host's
+   * generated code fail to compile, and a `UInt` field made the same host refuse the payload before
+   * the guest ever saw it. Both hosts are expected to answer identically, so a difference between
+   * them is a bug in one host and not a documented difference.
+   */
+  @Test fun narrowAndUnsignedScalarFieldsReachTheGuest() {
+    val payload = BridgedNarrowScalarProbe(
+      b = -1,
+      s = 300,
+      c = 'Z',
+      u = 4_000_000_000u,
+      ub = 200u,
+      us = 60_000u,
+      ul = 18_000_000_000_000_000_000uL,
+    )
+    assertEquals(
+      "-1|300|Z|4000000000|200|60000|18000000000000000000",
+      host.callGuestFunction("describeNarrowScalarProbe", listOf(payload)),
+    )
+  }
+
+  @Test fun narrowAndUnsignedScalarFieldsSurviveARoundTrip() {
+    val payload = BridgedNarrowScalarProbe(
+      b = -1,
+      s = 300,
+      c = 'Z',
+      u = 4_000_000_000u,
+      ub = 200u,
+      us = 60_000u,
+      ul = 18_000_000_000_000_000_000uL,
+    )
+    assertEquals(
+      "BridgedNarrowScalarProbe(b=-1, s=300, c=Z, u=4000000000, ub=200, us=60000, ul=18000000000000000000)",
+      roundTrip(payload).toString(),
+    )
+  }
+
+  /**
+   * Task 5.15, the `Any` half. A scalar that is not a field of a bridged class crosses through the
+   * host's dynamic encoder instead of a generated one, and that encoder is a separate list of
+   * cases: it refused every one of these with `HOST2JS: no bridge for 'kotlin.UInt'` on the
+   * Kotlin/Native host.
+   *
+   * The expectation is what the guest actually receives, which is the wire form rather than the
+   * Kotlin value: `Char` crosses as its code (as `CharArray` already did), and a `UInt` above
+   * `Int.MAX_VALUE` crosses as the `Int` with the same bits, because that is the number
+   * `HermesBridge_createInt` is handed. A receiver that decodes it back into a `UInt` reinterprets
+   * those bits and gets the original value, which is what the two tests above pin.
+   */
+  @Test fun narrowAndUnsignedScalarsCrossTheDynamicPath() {
+    val seen = listOf(
+      host.callGuestFunction("describeScalarArg", listOf(-1.toByte())),
+      host.callGuestFunction("describeScalarArg", listOf(300.toShort())),
+      host.callGuestFunction("describeScalarArg", listOf('Z')),
+      host.callGuestFunction("describeScalarArg", listOf(4_000_000_000u)),
+      host.callGuestFunction("describeScalarArg", listOf(200.toUByte())),
+      host.callGuestFunction("describeScalarArg", listOf(60_000.toUShort())),
+      host.callGuestFunction("describeScalarArg", listOf(18_000_000_000_000_000_000uL)),
+    )
+    assertEquals("-1|300|90|-294967296|-56|-5536|-446744073709551616", seen.joinToString("|"))
+  }
+
+  /**
+   * Task 5.16, the half both hosts can be held to. A supplementary character is one of the two
+   * places where Java's modified UTF-8 and standard UTF-8 disagree (a surrogate pair in six bytes,
+   * where UTF-8 wants four), and it is what the JNI host's raw `GetStringUTFChars` destroyed: the
+   * guest received an *empty string*, and reported it as `JsException: Char sequence is empty`.
+   * Nothing in the call was wrong, and nothing about the value was recoverable afterwards.
+   */
+  @Test fun supplementaryCharacterSurvivesTheBridge() {
+    val payload = BridgedEncodingProbe(s = "\uD83D\uDE00", tail = "tail")
+    assertEquals("2|56832|tail", host.callGuestFunction("describeEncodingProbe", listOf(payload)))
+  }
+
+  /** Code points below the surrogate boundary, which both encodings happen to agree on. */
+  @Test fun multiByteCharactersSurviveTheBridge() {
+    val payload = BridgedEncodingProbe(s = "éß中", tail = "tail")
+    assertEquals("3|20013|tail", host.callGuestFunction("describeEncodingProbe", listOf(payload)))
+  }
+
+  /**
+   * Task 5.17, the second disagreement between the two encodings: a NUL, which ends a C string.
+   * These rows were pinned per host while only the JVM host could carry them; both hosts do now, so
+   * they live here with the rest of the shared contract.
+   */
+  @Test fun nulStringReachesTheGuest() {
+    val payload = BridgedEncodingProbe(s = "a\u0000b", tail = "tail")
+    assertEquals("3|98|tail", host.callGuestFunction("describeEncodingProbe", listOf(payload)))
+  }
+
+  /** The guest's own string, built with a NUL in it, arriving whole. */
+  @Test fun nulStringFromTheGuestReachesTheHost() {
+    assertEquals(
+      "BridgedEncodingProbe(len=3, last=121, tail=guest-tail)",
+      host.callGuestFunction("provideEncodingProbe", emptyList()).toString(),
+    )
+  }
+
+  /** Both halves in one value, since a truncation on either leg is invisible from the other. */
+  @Test fun nulStringSurvivesARoundTrip() {
+    val payload = BridgedEncodingProbe(s = "a\u0000b", tail = "tail")
+    assertEquals(
+      "BridgedEncodingProbe(len=3, last=98, tail=tail)",
+      roundTrip(payload).toString(),
+    )
+  }
+
+  /**
+   * A high surrogate on its own, which no encoding can represent: Hermes hands over WTF-8 and JNI
+   * cannot represent it either. Both hosts replace it with U+FFFD rather than disagreeing by host or
+   * throwing, which is what this row holds them to -- the policy, not the damage.
+   */
+  @Test fun unpairedSurrogateBecomesAReplacementCharacter() {
+    val payload = BridgedEncodingProbe(s = "\uD800", tail = "tail")
+    assertEquals("1|65533|tail", host.callGuestFunction("describeEncodingProbe", listOf(payload)))
+  }
+
+  /** And back out of the guest intact, which is the other side of the same boundary. */
+  @Test fun supplementaryCharacterSurvivesARoundTrip() {
+    val payload = BridgedEncodingProbe(s = "\uD83D\uDE00", tail = "tail")
+    assertEquals(
+      "BridgedEncodingProbe(len=2, last=56832, tail=tail)",
+      roundTrip(payload).toString(),
+    )
+  }
+
+  /**
+   * The same properties coming back, which is the other half of the machinery: the host's decoder
+   * reads them, and a read made tolerant of absence answers with null for the reference-typed ones
+   * and with zero for `count`. Assigning that blindly would corrupt the host's own state, so the
+   * decode is presence-gated exactly like the guest's factory is.
+   */
+  @Test
+  fun narrowScalarFieldsSurviveARoundTrip() {
+    val payload = BridgedNarrowHolder(b = 7, s = -9, c = 'z', opt = 'X')
+    assertEquals(
+      "BridgedNarrowHolder(b=7, s=-9, c=z, opt=X)",
+      roundTrip(payload).toString(),
+    )
+  }
+
+  /**
+   * The host warms up every bridged module, and each one publishes its own factories object through
+   * `__bridgeRegisterRuntime`. The host merges them into one global; had it assigned the global
+   * instead, the last module loaded would own it and every class whose module loaded earlier would
+   * lose its create-factory, with the host reporting "the guest provides no create_..." for it.
+   *
+   * No single-module test bundle can see this: only the guest module here has bridged classes, so
+   * there was exactly one registration and the two behaviours were indistinguishable. compose-live
+   * has dozens of modules, and it found the difference on the first payload it sent.
+   */
+  @Test
+  fun factoriesPublishedByAnEarlierModuleSurviveALaterRegistration() {
+    // Stand in for a module that loads after the one carrying the fixtures.
+    host.evaluateForBridge(
+      """
+      __bridgeRegisterRuntime({
+        create_app_cash_zipline_bridge_test_LaterModulePayload: function (fields) {
+          return { builtBy: 'later' };
+        }
+      });
+      0
+      """,
+    )
+
+    val factories = "globalThis.__zipline_bridgeFactories"
+    // The guest's own runtime factories are still reachable...
+    assertEquals("function", host.evaluateForBridge("typeof $factories.newLong"))
+    // ...the later registration is visible beside them...
+    assertEquals(
+      "function",
+      host.evaluateForBridge(
+        "typeof $factories.create_app_cash_zipline_bridge_test_LaterModulePayload",
+      ),
+    )
+    // ...and the guest's create-factories still build payloads, which is the behaviour an
+    // overwrite would have destroyed.
+    assertEquals(BridgedTestValues.data, roundTrip(BridgedTestValues.data))
+  }
+
+  @Test
+  fun mutableBodyFieldsSurviveARoundTrip() {
+    val payload = BridgedMutableBody(a = 3).apply {
+      extra = "from-host"
+      tags = listOf("a", "b")
+      w = BridgedInline(9)
+      count = 7
+    }
+    assertEquals(
+      "BridgedMutableBody(a=3, extra=from-host, tags=[a, b], w=BridgedInline(raw=9), count=7)",
+      roundTrip(payload).toString(),
+    )
   }
 }

@@ -32,6 +32,12 @@ fun provideBridgedEnum(): BridgedEnum = BridgedTestValues.enumSecond
 @JsExport
 fun provideBridgedEnumHolder(): BridgedEnumHolder = BridgedTestValues.enumHolder
 
+// An enum with entry fields is reached through a holder, like BridgedEnum is: `@JsExport` on a
+// function whose *result* is such an enum makes the module lose its own bridge exports, which is a
+// Kotlin/JS export restriction rather than anything the bridge does.
+@JsExport
+fun provideBridgedSizedEnumHolder(): BridgedSizedEnumHolder = BridgedTestValues.sizedHolder
+
 @JsExport
 fun provideBridgedListHolder(): BridgedListHolder = BridgedTestValues.listHolder
 
@@ -166,3 +172,21 @@ fun echoHostValue(value: Any?): Any? = value
 
 @JsExport
 fun stringifyHostValue(value: Any?): String = JSON.stringify(value)
+
+@JsExport
+fun describeNarrowScalarProbe(value: BridgedNarrowScalarProbe): String = listOf(value.b, value.s, value.c, value.u, value.ub, value.us, value.ul).joinToString("|")
+
+@JsExport
+fun describeScalarArg(value: Any?): String = "$value"
+
+@JsExport
+fun describeEncodingProbe(value: BridgedEncodingProbe): String = "${value.s.length}|${value.s.lastOrNull()?.code ?: -1}|${value.tail}"
+
+@JsExport
+fun provideEncodingProbe(): BridgedEncodingProbe = BridgedEncodingProbe(s = "x\u0000y", tail = "guest-tail")
+
+@JsExport
+fun describeNarrowHolder(value: BridgedNarrowHolder): String = "${value.b}|${value.s}|${value.c}|${value.opt ?: '-'}"
+
+@JsExport
+fun describeMutableBody(value: BridgedMutableBody): String = "${value.a}|${value.extra}|${value.tags.joinToString("+")}|${value.w.raw}|${value.count}"

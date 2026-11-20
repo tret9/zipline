@@ -47,6 +47,76 @@ jsi::Object globalBridgeMap(jsi::Runtime &rt, const char *name) {
   return created;
 }
 
+// Copy every property of [source] that the host could read on it -- own or inherited -- onto
+// [target]. Used for the globals the guest fills in module by module; see the
+// __bridgeRegisterRuntime hook.
+// jsi::Object has no copy or move constructor, so both handles come in by reference.
+// Records that a guest registration arrived unusable, and what arrived, into a global the host reads
+// back after each module load. Recorded rather than thrown: the guest wraps its own
+// `__bridgeRegisterRuntime` call in a tolerant try/catch, so an exception raised here cannot escape --
+// the defect survives to a much later host->JS conversion as "the guest provides no create_<fqn>",
+// naming neither the module nor the reason. Only the first problem is kept: it is the one that
+// happened, everything after it is downstream.
+void recordFactoriesProblem(jsi::Runtime &rt, const std::string &detail) {
+    try {
+        if (rt.global().getProperty(rt, "__zipline_bridgeFactoriesProblem").isString()) return;
+        // The bad registration is attributed to the module that was loading, which the loader keeps
+        // in this global (CURRENT_MODULE_ID in hostMain's defineJs.kt). Without it the report can only
+        // name whichever module the host checked first, and a module that loaded cleanly before the
+        // culprit would be blamed for it.
+        std::string message = detail;
+        jsi::Value loading = rt.global().getProperty(rt, "app_cash_zipline_currentModuleId");
+        if (loading.isString()) message += " (while loading " + loading.asString(rt).utf8(rt) + ")";
+        rt.global().setProperty(
+            rt, "__zipline_bridgeFactoriesProblem", jsi::String::createFromUtf8(rt, message));
+    } catch (const std::exception &) {
+    }
+}
+
+// jsi::Value cannot be copied, so this takes the hook's argument array rather than a value: the
+// "called with nothing" case has no value to name.
+const char *describeBridgeArgument(const jsi::Value *args, size_t argc) {
+    if (argc < 1) return "nothing";
+    const jsi::Value &value = args[0];
+    if (value.isUndefined()) return "undefined";
+    if (value.isNull()) return "null";
+    if (value.isBool()) return "a boolean";
+    if (value.isNumber()) return "a number";
+    if (value.isString()) return "a string";
+    if (value.isSymbol()) return "a symbol";
+    return "a value of no recognisable kind";
+}
+
+void mergeBridgeFactories(jsi::Runtime &rt, jsi::Object &target, jsi::Object &source) {
+  // The guest's factories object is a Kotlin/JS `object` instance: newLong, newArrayList and every
+  // create-factory are methods on its PROTOTYPE and are not enumerable, so copying the own enumerable
+  // keys copies nothing at all -- the host would keep an empty map and report "the guest provides no
+  // create_..." for every class. Walk the prototype chain instead, which is what a property read on
+  // the instance does, so whatever the host could find on the instance it can still find here.
+  jsi::Object objectCtor = rt.global().getPropertyAsObject(rt, "Object");
+  jsi::Function getOwnPropertyNames = objectCtor.getPropertyAsFunction(rt, "getOwnPropertyNames");
+  jsi::Function getPrototypeOf = objectCtor.getPropertyAsFunction(rt, "getPrototypeOf");
+  jsi::Value objectPrototype = objectCtor.getProperty(rt, "prototype");
+
+  jsi::Value current = jsi::Value(rt, source);
+  while (current.isObject() && !jsi::Value::strictEquals(rt, current, objectPrototype)) {
+    jsi::Value args[1] = {jsi::Value(rt, current.asObject(rt))};
+    jsi::Object names =
+        getOwnPropertyNames.call(rt, static_cast<const jsi::Value *>(args), static_cast<size_t>(1))
+            .asObject(rt);
+    // Explicit Value indices: a bare integer is ambiguous against jsi::Value's converting
+    // constructors, and this jsi has no Object::get(Runtime&, Value).
+    double count = names.getProperty(rt, "length").asNumber();
+    for (double i = 0; i < count; i++) {
+      jsi::Value name = names.getProperty(rt, jsi::Value(i));
+      std::string key = name.asString(rt).utf8(rt);
+      if (key == "constructor") continue;
+      target.setProperty(
+          rt, jsi::PropNameID::forUtf8(rt, key), current.asObject(rt).getProperty(rt, name));
+    }
+    current = getPrototypeOf.call(rt, static_cast<const jsi::Value *>(args), static_cast<size_t>(1));
+  }
+}
 }  // namespace
 
 extern "C" __attribute__((used, visibility("default"))) void addBridgeEntry(const char* fq, jobject(*fn)(JNIEnv*,jsi::Runtime&,const jsi::Value&)) {
@@ -106,12 +176,47 @@ extern "C" __attribute__((used, visibility("default"))) void register_all(jsi::R
         jsi::PropNameID::forUtf8(rt, "__bridgeRegisterRuntime"),
         1,
         [](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t argc) -> jsi::Value {
-            if (argc < 1 || !args[0].isObject()) return jsi::Value::undefined();
+            if (argc < 1 || !args[0].isObject()) {
+              // The call site is generated, so a non-object is not a caller mistake: the construction
+              // the plugin emitted produced nothing at all.
+              recordFactoriesProblem(rt,
+                  std::string("__bridgeRegisterRuntime was called with ") +
+                      describeBridgeArgument(args, argc) +
+                      " instead of a factories object");
+              return jsi::Value::undefined();
+            }
             // The factories build real Kotlin/JS Long/ArrayList/LinkedHashMap instances; they are
             // the guest's own stdlib calls, so nothing here relies on Kotlin/JS internals. The
             // instance carries newLong/newArrayList/newLinkedHashMap through its prototype, so
             // the host can read them off it directly.
-            rt.global().setProperty(rt, HOST2JS_FACTORIES_GLOBAL, args[0]);
+            //
+            // MERGE, do not replace. Every bridged module calls __bridgeRegisterRuntime when it is
+            // warmed up, and each passes its own factories object -- prototypes are merged the same
+            // way just above, and for the same reason. Assigning the global would hand ownership to
+            // whichever module loaded last and silently discard every other module's create-factories
+            // and runtime factories. An application has dozens of modules; a test bundle has one,
+            // which is exactly why this is invisible until the app is run: the host then looks up
+            // `create_<fqn>` for a class whose module loaded earlier and finds nothing.
+            jsi::Object factories = globalBridgeMap(rt, HOST2JS_FACTORIES_GLOBAL);
+            jsi::Object published = args[0].asObject(rt);
+            // Merged rather than assigned: the guest publishes one factories object per warmed-up
+            // module, so assigning hands the global to whichever module warmed up last and silently
+            // discards every other module's create-factories and newLong. A test bundle has a single
+            // bridged module -- one registration, where the two behave identically -- and compose-live's
+            // first host->JS payload is what told them apart.
+            //
+            // Merging is unconditional, and that is deliberate. Skipping repeats by marking the source's
+            // constructor was tried, and is not sound: two registrations whose sources are plain object
+            // literals share `Object` as their constructor, so the second is silently dropped -- caught
+            // by `a second module's runtime registration keeps the first module's factories` in
+            // Host2JsRuntimeTest. Repeated registrations from one module would cost a few thousand
+            // property copies at load; the merge is the part worth keeping simple.
+            mergeBridgeFactories(rt, factories, published);
+            jsi::Value newLong = factories.getProperty(rt, "newLong");
+            if (!newLong.isObject() || !newLong.asObject(rt).isFunction(rt)) {
+              recordFactoriesProblem(rt,
+                  "the published factories object carries no newLong, so it had no methods to merge");
+            }
             return jsi::Value::undefined();
         });
 
@@ -169,6 +274,44 @@ bool tryAsInt64(double d, int64_t& out) {
  * caller is dropping the work item anyway. The message goes to logcat (Android) or stderr (JVM)
  * so the real cause stays visible.
  */
+/**
+ * Reports a pending Java exception and puts the *same* throwable back.
+ *
+ * The sink paths bail rather than make another JNI call, which is right, but bailing quietly is not:
+ * the exception reaches Kotlin inside a frame-clock coroutine, which dies without a log, so "every
+ * module downloaded and then nothing but loading placeholders" had no author. Naming it is free, and
+ * re-throwing keeps the propagation that makes it somebody's problem. toString() is itself a JNI call,
+ * so the exception must be cleared first and re-thrown after.
+ */
+void reportAndKeepPendingException(JNIEnv* env, const char* what) {
+  if (!env->ExceptionCheck()) return;
+  jthrowable pending = env->ExceptionOccurred();
+  env->ExceptionClear();
+  std::string description = "<unreadable>";
+  if (pending != nullptr) {
+    jclass throwableClass = env->FindClass("java/lang/Throwable");
+    if (throwableClass != nullptr) {
+      jmethodID toString = env->GetMethodID(throwableClass, "toString", "()Ljava/lang/String;");
+      if (toString != nullptr) {
+        jstring text = static_cast<jstring>(env->CallObjectMethod(pending, toString));
+        if (!env->ExceptionCheck() && text != nullptr) {
+          description = zipline::jniStringToUtf8(env, text);
+        }
+      }
+      env->ExceptionClear();
+      env->DeleteLocalRef(throwableClass);
+    }
+    env->ExceptionClear();
+    if (env->Throw(pending) != JNI_OK) description += " (re-throwing it failed too)";
+    env->DeleteLocalRef(pending);
+  }
+#ifdef __ANDROID__
+  __android_log_print(ANDROID_LOG_ERROR, "BRIDGE", "%s: %s", what, description.c_str());
+#else
+  fprintf(stderr, "BRIDGE: %s: %s\n", what, description.c_str());
+#endif
+}
+
 void reportAndClearPendingException(JNIEnv* env, const char* what) {
   if (!env->ExceptionCheck()) return;
   jthrowable pending = env->ExceptionOccurred();
@@ -343,7 +486,10 @@ jobject ContextJni::execute(JNIEnv* env, jbyteArray byteCode, jstring fileName) 
     throwJsExceptionFmt(env, this, "Hermes execute failed: %s", e.what());
     return nullptr;
   }
-  return toJavaObject(env, result, /*throwOnUnsupportedType=*/false);
+  // Use time is loud: an unbridged class instance returned to the host throws
+  // ZiplineApiMismatchException instead of decoding to a silent null. Plain JS data and
+  // kotlin.Unit stay exempt (jsiIsUnbridgedDecodeExemptClass).
+  return toJavaObject(env, result, /*throwOnUnsupportedType=*/true);
 }
 
 jobject ContextJni::evaluate(JNIEnv* env, jstring source, jstring fileName) {
@@ -379,7 +525,7 @@ jobject ContextJni::evaluate(JNIEnv* env, jstring source, jstring fileName) {
     throwJsExceptionFmt(env, this, "Hermes evaluate failed: %s", e.what());
     return nullptr;
   }
-  return toJavaObject(env, result, /*throwOnUnsupportedType=*/false);
+  return toJavaObject(env, result, /*throwOnUnsupportedType=*/true);
 #endif // HERMESVM_LEAN
 }
 
@@ -498,8 +644,25 @@ void ContextJni::setOutboundCallChannel(JNIEnv* env, jstring name, jobject callC
   outboundChannels.push_back(occ);
 }
 
+// The padded public entry: no C++ exception may escape into the JNI frame, where it would
+// reach std::terminate. Every JS->host decode crosses here.
 jobject
 ContextJni::toJavaObject(JNIEnv* env, const jsi::Value& value, bool throwOnUnsupportedType) {
+  try {
+    return toJavaObjectUnchecked(env, value, throwOnUnsupportedType);
+  } catch (const jsi::JSIException& e) {
+    // jsi::JSError and JSINativeException both derive from JSIException; the number/bool
+    // reads throw the sibling of JSError, so catching only JSError leaves those aborting.
+    jsiThrowBridgeEscape(env, "toJavaObject", e.what());
+    return nullptr;
+  } catch (const std::exception& e) {
+    jsiThrowBridgeEscape(env, "toJavaObject", e.what());
+    return nullptr;
+  }
+}
+
+jobject
+ContextJni::toJavaObjectUnchecked(JNIEnv* env, const jsi::Value& value, bool throwOnUnsupportedType) {
   // A pending Java exception (e.g. a host bridge that threw while guest code ran) makes every
   // further JNI call undefined; never start a conversion on top of one.
   if (env->ExceptionCheck()) return nullptr;
@@ -542,7 +705,7 @@ ContextJni::toJavaObject(JNIEnv* env, const jsi::Value& value, bool throwOnUnsup
       size_t len = arr.length(*runtime);
       jobjectArray result = env->NewObjectArray(static_cast<jsize>(len), objectClass, nullptr);
       for (size_t i = 0; i < len && !env->ExceptionCheck(); i++) {
-        jobject el = toJavaObject(env, arr.getValueAtIndex(*runtime, i), false);
+        jobject el = toJavaObjectUnchecked(env, arr.getValueAtIndex(*runtime, i), false);
         if (env->ExceptionCheck()) break;
         env->SetObjectArrayElement(result, static_cast<jsize>(i), el);
         if (el) env->DeleteLocalRef(el);
@@ -650,6 +813,14 @@ jobject ContextJni::callGuestFunction(JNIEnv* env, jstring name, jobject argsLis
     return toJavaObject(env, result, true);
   } catch (const jsi::JSError& e) {
     throwJsException(env, const_cast<jsi::JSError&>(e));
+    return nullptr;
+  } catch (const jsi::JSIException& e) {
+    // JSINativeException (thrown by number/bool reads) is a sibling of JSError; catching
+    // only JSError left those aborting the process.
+    throwJsExceptionFmt(env, this, "callGuestFunction failed: %s", e.what());
+    return nullptr;
+  } catch (const std::exception& e) {
+    throwJsExceptionFmt(env, this, "callGuestFunction failed: %s", e.what());
     return nullptr;
   }
 }
@@ -887,6 +1058,9 @@ void ContextJni::cacheDirectChangeSink(jobject sink) {
 }
 
 jobject ContextJni::jsValueToJsonElement(JNIEnv* env, const jsi::Value& val) {
+  // Every caller below crosses into Java, so a decode that begins with an exception already pending
+  // would make the next JNI call illegal. Bail and let that exception propagate.
+  if (env->ExceptionCheck()) return nullptr;
   if (val.isNumber()) {
     double v = val.asNumber();
     int64_t lv;
@@ -934,13 +1108,18 @@ jobject ContextJni::jsArrayToJsonElement(JNIEnv* env, const jsi::Value& val) {
   size_t length = arr.length(*runtime);
 
   jobject arrayList = env->NewObject(arrayListClass, arrayListInitWithCapacity, (int)length);
-  for (size_t i = 0; i < length; i++) {
+  if (env->ExceptionCheck()) return nullptr;
+  for (size_t i = 0; i < length && !env->ExceptionCheck(); i++) {
     jsi::Value element = arr.getValueAtIndex(*runtime, i);
     jobject jsonElement = jsValueToJsonElement(env, element);
     if (jsonElement != nullptr) {
       env->CallBooleanMethod(arrayList, arrayListAdd, jsonElement);
       env->DeleteLocalRef(jsonElement);
     }
+  }
+  if (env->ExceptionCheck()) {
+    env->DeleteLocalRef(arrayList);
+    return nullptr;
   }
   jobject result = env->CallStaticObjectMethod(
           directBridgeClass, directBridgeCreateJsonArray, arrayList);
@@ -955,22 +1134,28 @@ jobject ContextJni::jsObjectToJsonElement(JNIEnv* env, const jsi::Value& val) {
 
   jobject keysList = env->NewObject(arrayListClass, arrayListInitWithCapacity, (int)numProps);
   jobject valuesList = env->NewObject(arrayListClass, arrayListInitWithCapacity, (int)numProps);
+  if (env->ExceptionCheck()) return nullptr;
 
-  for (size_t i = 0; i < numProps; i++) {
+  for (size_t i = 0; i < numProps && !env->ExceptionCheck(); i++) {
     jsi::Value propName = propertyNames.getValueAtIndex(*runtime, i);
     if (!propName.isString()) continue;
     std::string key = propName.asString(*runtime).utf8(*runtime);
     jsi::Value propVal = obj.getProperty(*runtime, key.c_str());
     jstring keyJava = zipline::utf8ToJniString(env, key);
     jobject jsonElement = jsValueToJsonElement(env, propVal);
+    if (keyJava != nullptr) env->DeleteLocalRef(keyJava);
     if (jsonElement != nullptr) {
       env->CallBooleanMethod(keysList, arrayListAdd, keyJava);
       env->CallBooleanMethod(valuesList, arrayListAdd, jsonElement);
       env->DeleteLocalRef(jsonElement);
     }
-    env->DeleteLocalRef(keyJava);
   }
 
+  if (env->ExceptionCheck()) {
+    env->DeleteLocalRef(keysList);
+    env->DeleteLocalRef(valuesList);
+    return nullptr;
+  }
   jobject result = env->CallStaticObjectMethod(
           directBridgeClass, directBridgeCreateJsonObject, keysList, valuesList);
   env->DeleteLocalRef(keysList);
@@ -985,17 +1170,26 @@ void ContextJni::dispatchChangeToSink(JNIEnv* env, const DirectChange& ch) {
       break;
     case DirectChangeType::PropertyChange: {
       jobject jsonElement = jsValueToJsonElement(env, *ch.jsValue);
+      if (env->ExceptionCheck()) {
+        reportAndKeepPendingException(env, "host bridge: dropping a property change");
+        return;
+      }  // see the comment at the ModifierChange case below
       env->CallVoidMethod(directChangeSink, directSinkCreatePropertyChange,
                           ch.id, ch.field1, ch.field2, jsonElement);
       if (jsonElement) env->DeleteLocalRef(jsonElement);
       break;
     }
     case DirectChangeType::ModifierChange: {
+      // This is the site that killed the app: decoding a modifier element runs a host converter, a
+      // host converter is Java, Java threw ZiplineApiMismatchException for a class with no converter,
+      // and the pair() beneath it was then constructed on top of the pending exception. ART aborts
+      // on that and prints the abort, not the cause; the cause was already named correctly.
       jobject elementsList = env->NewObject(arrayListClass, arrayListInit);
+      if (env->ExceptionCheck()) return;
       if (ch.jsValue && ch.jsValue->isObject() && ch.jsValue->asObject(*runtime).isArray(*runtime)) {
         jsi::Array arr = ch.jsValue->asObject(*runtime).asArray(*runtime);
         size_t numElements = arr.length(*runtime);
-        for (size_t j = 0; j < numElements; j++) {
+        for (size_t j = 0; j < numElements && !env->ExceptionCheck(); j++) {
           jsi::Value elem = arr.getValueAtIndex(*runtime, j);
           jsi::Value modTagVal = elem.asObject(*runtime).getProperty(*runtime, "0");
           int mTag = static_cast<int>(modTagVal.asNumber());
@@ -1003,13 +1197,20 @@ void ContextJni::dispatchChangeToSink(JNIEnv* env, const DirectChange& ch) {
           jobject jModVal = modVal.isUndefined()
               ? env->CallStaticObjectMethod(directBridgeClass, directBridgeJsonNull)
               : jsValueToJsonElement(env, modVal);
+          if (env->ExceptionCheck()) break;
           jobject jTag = env->CallStaticObjectMethod(integerClass, integerValueOf, (jint)mTag);
+          if (env->ExceptionCheck()) break;
           jobject pair = env->NewObject(pairClass, pairInit, jTag, jModVal);
           env->CallBooleanMethod(elementsList, arrayListAdd, pair);
           if (jTag) env->DeleteLocalRef(jTag);
           if (jModVal) env->DeleteLocalRef(jModVal);
           env->DeleteLocalRef(pair);
         }
+      }
+      if (env->ExceptionCheck()) {
+        env->DeleteLocalRef(elementsList);
+        reportAndKeepPendingException(env, "host bridge: dropping a modifier change");
+        return;
       }
       env->CallVoidMethod(directChangeSink, directSinkCreateModifierChange, ch.id, elementsList);
       env->DeleteLocalRef(elementsList);
@@ -1062,8 +1263,19 @@ void ContextJni::flushPendingBatch(JNIEnv* env, int toFlush) {
 
   for (int i = 0; i < toFlush; i++) {
     dispatchChangeToSink(env, pendingChanges[i]);
+    if (env->ExceptionCheck()) {
+      // Half a batch reached the sink and the rest never will. Say so, and keep the exception: a host
+      // that stopped painting looks from outside exactly like one still waiting for data.
+      reportAndKeepPendingException(env, "host bridge: change batch truncated");
+      break;
+    }
   }
-  env->CallVoidMethod(directChangeSink, directSinkSendBatch);
+  // Only the dispatch is guarded. `sendBatch` is what makes the sink apply what it was given, so
+  // skipping it on any path -- as a previous revision of these two functions did, which is how this
+  // comment came to exist -- means the host receives changes and never paints them.
+  if (!env->ExceptionCheck()) {
+    env->CallVoidMethod(directChangeSink, directSinkSendBatch);
+  }
   pendingChanges.erase(pendingChanges.begin(), pendingChanges.begin() + toFlush);
 }
 
@@ -1078,8 +1290,13 @@ void ContextJni::finishFlushPending(JNIEnv* env) {
 
   for (int i = 0; i < remaining; i++) {
     dispatchChangeToSink(env, pendingChanges[i]);
+    if (env->ExceptionCheck()) break;
   }
-  env->CallVoidMethod(directChangeSink, directSinkSendChanges);
+  if (env->ExceptionCheck()) {
+    reportAndKeepPendingException(env, "host bridge: changes dropped before send");
+  } else {
+    env->CallVoidMethod(directChangeSink, directSinkSendChanges);
+  }
   pendingChanges.clear();
 }
 
