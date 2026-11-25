@@ -26,6 +26,8 @@
 #include <cstring>
 #include <string>
 
+#include "JniUtf8.h"  // JNI speaks MODIFIED UTF-8, Hermes speaks UTF-8
+
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -81,6 +83,140 @@ enum {
   JS_TAG_INT = 0, JS_TAG_BOOL = 1, JS_TAG_NULL = 2, JS_TAG_UNDEFINED = 3,
   JS_TAG_STRING = 4, JS_TAG_OBJECT = 5, JS_TAG_FLOAT64 = 7
 };
+
+/** The JS kind name for a tag, matching the mismatch-message vocabulary. */
+static inline const char *jsiKindName(int tag) {
+  switch (tag) {
+    case JS_TAG_INT:
+    case JS_TAG_FLOAT64: return "a number";
+    case JS_TAG_BOOL:    return "a boolean";
+    case JS_TAG_NULL:    return "null";
+    case JS_TAG_UNDEFINED: return "undefined";
+    case JS_TAG_STRING:  return "a string";
+    case JS_TAG_OBJECT:  return "an object";
+    default:             return "an unknown JS type";
+  }
+}
+
+/**
+ * Throw ZiplineApiMismatchException with [message]. Falls back to IllegalStateException when
+ * ZiplineApiMismatchException is not on the classpath, so a decode never leaves a
+ * NoClassDefFoundError pending.
+ */
+static inline void jsiThrowApiMismatch(JNIEnv *env, const char *message) {
+  jclass cls = env->FindClass("app/cash/zipline/ZiplineApiMismatchException");
+  if (cls == nullptr) {
+    env->ExceptionClear();
+    cls = env->FindClass("java/lang/IllegalStateException");
+  }
+  env->ThrowNew(cls, message);
+  env->DeleteLocalRef(cls);
+}
+
+/**
+ * Throw ZiplineApiMismatchException for a field the guest's object cannot supply.
+ * Names the class, the field, the expected type, and the JS kind seen.
+ */
+static inline void jsiThrowFieldMismatch(JNIEnv *env, const char *className,
+                                        const char *fieldName,
+                                        const char *expectedType,
+                                        int seenTag) {
+  char msg[512];
+  snprintf(msg, sizeof(msg), "host bridge: %s.%s expects %s but the guest sent %s",
+           className, fieldName, expectedType, jsiKindName(seenTag));
+  jsiThrowApiMismatch(env, msg);
+}
+
+/**
+ * Throw ZiplineApiMismatchException when the compiled bridge references a host field that the
+ * runtime host class does not declare (GetFieldID failed at load).
+ */
+static inline void jsiThrowHostFieldMissing(JNIEnv *env, const char *className,
+                                          const char *fieldName) {
+  char msg[512];
+  snprintf(msg, sizeof(msg),
+           "host bridge: the host class %s has no field %s; the compiled bridge and the host "
+           "class are out of sync",
+           className, fieldName);
+  jsiThrowApiMismatch(env, msg);
+}
+
+/** Throw ZiplineApiMismatchException for a bridged class whose load-time init failed. */
+static inline void jsiThrowClassInitFailed(JNIEnv *env, const char *className) {
+  char msg[512];
+  snprintf(msg, sizeof(msg), "host bridge: %s failed to initialize; the JVM class is missing",
+           className);
+  jsiThrowApiMismatch(env, msg);
+}
+
+/** Throw ZiplineApiMismatchException wrapping a C++ exception that escaped a bridge decode. */
+static inline void jsiThrowBridgeEscape(JNIEnv *env, const char *className, const char *what) {
+  char msg[512];
+  snprintf(msg, sizeof(msg), "host bridge: %s: %s", className, what);
+  jsiThrowApiMismatch(env, msg);
+}
+
+// -- Load-time lookup helpers --
+//
+// Invariant: load time never throws. A generated `_init` runs at shared-library load, where a
+// pending JNI exception would propagate into the JVM as NoSuchFieldError/NoClassDefFoundError
+// before any bridged class is used. Each lookup below clears the exception it raises and returns
+// NULL, so a missing reference is *recorded* rather than *reported*; the report happens at use
+// time (jsiThrowClassInitFailed / jsiThrowHostFieldMissing / jsiThrowFieldMismatch).
+
+/** FindClass that records absence as NULL instead of leaving NoClassDefFoundError pending. */
+static inline jclass jsiFindClassQuiet(JNIEnv *env, const char *name) {
+  jclass c = env->FindClass(name);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return NULL;
+  }
+  return c;
+}
+
+static inline jmethodID jsiGetMethodIdQuiet(JNIEnv *env, jclass c, const char *name,
+                                          const char *sig) {
+  if (c == NULL) return NULL;
+  jmethodID m = env->GetMethodID(c, name, sig);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return NULL;
+  }
+  return m;
+}
+
+static inline jmethodID jsiGetStaticMethodIdQuiet(JNIEnv *env, jclass c, const char *name,
+                                                const char *sig) {
+  if (c == NULL) return NULL;
+  jmethodID m = env->GetStaticMethodID(c, name, sig);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return NULL;
+  }
+  return m;
+}
+
+static inline jfieldID jsiGetFieldIdQuiet(JNIEnv *env, jclass c, const char *name,
+                                        const char *sig) {
+  if (c == NULL) return NULL;
+  jfieldID f = env->GetFieldID(c, name, sig);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return NULL;
+  }
+  return f;
+}
+
+static inline jfieldID jsiGetStaticFieldIdQuiet(JNIEnv *env, jclass c, const char *name,
+                                              const char *sig) {
+  if (c == NULL) return NULL;
+  jfieldID f = env->GetStaticFieldID(c, name, sig);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return NULL;
+  }
+  return f;
+}
 
 // Tag emulation: maps jsi::Value to a numeric tag
 static inline int jsi_value_tag(jsi::Runtime &rt, const jsi::Value &v) {
@@ -205,8 +341,17 @@ static inline jobject jsiBridgeTryUnwrapLong(JNIEnv *env, jsi::Runtime &rt, cons
   jsi::Value high = jsiCallValueOp(rt, ops, "longHigh", v);
   jlong value = (static_cast<jlong>(static_cast<int32_t>(high.asNumber())) << 32) |
                 (static_cast<jlong>(static_cast<uint32_t>(static_cast<int32_t>(low.asNumber()))));
+  // Asking the guest for the two halves runs JavaScript, which may have called back into Java and
+  // thrown; the check belongs before FindClass rather than after NewObject, because a JNI call made
+  // with an exception pending aborts the process rather than returning the error to Kotlin.
+  if (env->ExceptionCheck()) return nullptr;
   jclass c = env->FindClass("java/lang/Long");
+  if (c == nullptr) return nullptr;
   jmethodID m = env->GetMethodID(c, "<init>", "(J)V");
+  if (m == nullptr) {
+    env->DeleteLocalRef(c);
+    return nullptr;
+  }
   jobject boxed = env->NewObject(c, m, value);
   env->DeleteLocalRef(c);
   if (env->ExceptionCheck()) return nullptr;
@@ -267,7 +412,7 @@ static inline bool jsiIsUnbridgedDecodeExemptClass(const std::string &name) {
 }
 
 /**
- * Throw IllegalStateException naming the JS class of [v] when it looks like a Kotlin class
+ * Throw ZiplineApiMismatchException naming the JS class of [v] when it looks like a Kotlin class
  * instance that no bridge converter was registered for. Returning null here used to surface as a
  * confusing cast/NPE far from the cause (e.g. a List<TopBarIcon> arriving as [null] because
  * TopBarIcon was not annotated), so name the class instead.
@@ -286,7 +431,7 @@ static inline void jsiThrowUnbridgedJsObject(JNIEnv *env, jsi::Runtime &rt, cons
 
   std::string message = "host bridge: no converter registered for JS class '" + className +
                         "'; annotate the class with @WithJS2HostBridge to send it to the host";
-  env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), message.c_str());
+  jsiThrowApiMismatch(env, message.c_str());
 }
 
 // JNI caches for the collection decoder. Function-local statics inside this inline function give
@@ -455,7 +600,13 @@ static inline jobject jsi_value_to_boxed(
     return boxed;
   }
   if (v.isString()) {
-    jstring s = env->NewStringUTF(v.asString(rt).utf8(rt).c_str());
+    // `NewStringUTF` does not take UTF-8: JNI's encoding is Java's *modified* UTF-8, which
+    // encodes NUL as two bytes and a supplementary character as a surrogate pair. Handing it
+    // Hermes' output truncates at a NUL and mangles anything above U+FFFF -- measured, a host
+    // that sent "a\u0000b" got back "a". `utf8ToJniString` converts through UTF-16, which both
+    // sides agree on. The JSON path already does this via ContextJni::toJavaString; only the
+    // bridge path was left on the raw JNI call.
+    jstring s = zipline::utf8ToJniString(env, v.asString(rt).utf8(rt));
     if (env->ExceptionCheck()) return nullptr;
     return s;
   }
@@ -519,10 +670,22 @@ static inline jobject jsi_value_to_boxed(
   return nullptr;
 }
 
-// A host value with a @WithHost2JSBridge counterpart crosses to the guest as an instance whose
-// prototype is the guest class's own prototype, with every field defined as an own data
-// property. The guest registers its prototypes and the runtime factories it needs (Long,
-// ArrayList, LinkedHashMap) through __bridgeRegister / __bridgeRegisterRuntime at module load;
+// A host value with a @WithHost2JSBridge counterpart crosses to the guest as an instance the GUEST
+// built. The host defines every field as an own data property on an object carrying the guest class's
+// own prototype and hands that object to the guest's generated `create_<fq>` factory, which runs the
+// class's real constructor on the values: initializer blocks, computed body properties, validation and
+// default expressions all happen, and a parameter the host does not have takes its guest-side default.
+// The factory reads own properties only, so the prototype the carrier carries cannot masquerade as a
+// sent value.
+//
+// There is no second path: a guest that publishes no create-factory fails, naming the factory, rather
+// than being handed the stamped lookalike this header used to build. Skipping the guest's constructor
+// quietly is what this code exists to stop doing; refusing loudly is a build-and-ship question, and a
+// silent fallback would decide it in the dark.
+//
+// The guest registers its prototypes and the runtime factories it needs (Long, ArrayList, LinkedHashMap,
+// the payload holder, and one create-factory per bridged class) through __bridgeRegister /
+// __bridgeRegisterRuntime at module load;
 // the host keeps both in JS globals, so a converter compiled into a separate consumer library
 // needs nothing but the runtime and this header.
 //
@@ -594,6 +757,117 @@ static inline jsi::Value jsiHost2JsRuntimeFactory(JNIEnv *env, jsi::Runtime &rt,
   return fn;
 }
 
+/**
+ * The guest's create-factory named [name], or undefined when the guest publishes none.
+ *
+ * The only caller reports the absence rather than working around it — see
+ * [jsiHost2JsCallCreateFactory].
+ */
+static inline jsi::Value jsiHost2JsFindCreateFactory(jsi::Runtime &rt, const char *name) {
+  jsi::Value factories = rt.global().getProperty(rt, HOST2JS_FACTORIES_GLOBAL);
+  if (!factories.isObject()) return jsi::Value::undefined();
+  jsi::Value fn = factories.asObject(rt).getProperty(rt, name);
+  if (!fn.isObject() || !fn.asObject(rt).isFunction(rt)) return jsi::Value::undefined();
+  return fn;
+}
+
+/**
+ * What the host could actually see when a create-factory was missing, appended to the report.
+ *
+ * "the guest provides no create_X" covers three different failures that the message alone cannot tell
+ * apart: no module published a factories object at all (the warm-up hook never ran, or the host never
+ * installed the hook and the guest's tolerance swallowed that), a factories object is there but empty
+ * (a registration arrived and contributed nothing), or a perfectly good object came from other modules
+ * while this class's module never registered. The prototype question separates the last of those, since
+ * prototypes reach the host by a different route than the factories do.
+ */
+// Reads a diagnostic global the C++ warm-up bookkeeping maintains, with a cap: these strings exist to
+// be printed inside an exception message, and a bundle with dozens of modules must not turn the report
+// into a wall of ids.
+static inline std::string jsiGlobalString(jsi::Runtime &rt, const char *name, size_t limit) {
+  std::string out = " <unset>";
+  try {
+    jsi::Value value = rt.global().getProperty(rt, name);
+    if (value.isString()) {
+      out = value.asString(rt).utf8(rt);
+      if (out.empty()) out = " <none>";
+      if (out.size() > limit) out = out.substr(0, limit) + "...";
+    }
+  } catch (const std::exception &) {
+  }
+  return out;
+}
+
+// "is a function" / "is undefined": whether the host installed a hook at all is a different defect
+// from a guest that never called it, and the factories global being absent looks identical either way.
+static inline const char *jsiRuntimeGlobalType(jsi::Runtime &rt, const char *name) {
+  try {
+    jsi::Value value = rt.global().getProperty(rt, name);
+    if (value.isUndefined()) return "there is";
+    if (value.isObject() && value.asObject(rt).isFunction(rt)) return "there is a";
+    return "there is a non-function";
+  } catch (const std::exception &) {
+    return "reading";
+  }
+}
+
+static inline std::string jsiHost2JsRegistrationState(jsi::Runtime &rt, const char *fq) {
+  std::string out;
+  jsi::Value factories = rt.global().getProperty(rt, HOST2JS_FACTORIES_GLOBAL);
+  if (!factories.isObject()) {
+    out = std::string("the factories global is absent (no module published one; on this runtime ") +
+          jsiRuntimeGlobalType(rt, "__bridgeRegisterRuntime") +
+          " __bridgeRegisterRuntime, and " + jsiRuntimeGlobalType(rt, "__bridgeRegister") +
+          " __bridgeRegister)";
+  } else {
+    jsi::Value newLong = factories.asObject(rt).getProperty(rt, "newLong");
+    if (newLong.isObject() && newLong.asObject(rt).isFunction(rt)) {
+      out = "a factories object is present and its newLong is reachable, so some module registered "
+            "and this class's module did not";
+    } else {
+      out = "a factories object is present but its newLong is not reachable, so a registration "
+            "arrived empty";
+    }
+  }
+  out += jsiHost2JsPrototype(rt, fq).isObject()
+             ? "; this class registered its prototype"
+             : "; this class registered no prototype";
+  // What the host did about each module's warm-up hook. A failure to find a create-factory is
+  // indistinguishable from "this module was never warmed up", and the guest swallows a missing host
+  // hook, so this is the only place the distinction surfaces. Truncated because a 46-module app
+  // produces more line than a log message should carry; the ids that matter -- the ones that were
+  // called, and this class's own module if it appears -- are short.
+  out += "; warm-up " + jsiGlobalString(rt, "__zipline_bridgeWarmUpStatus", 80);
+  out += "; hooks called for:" + jsiGlobalString(rt, "__zipline_bridgeWarmUpCalled", 320);
+  out += "; missed:" + jsiGlobalString(rt, "__zipline_bridgeWarmUpMissed", 320);
+  return out;
+}
+
+/**
+ * Hand the host's fields object to the guest's `create_<name>` and return the instance the guest built
+ * from it. The guest's constructor runs, defaults and all; the object's prototype is not consulted
+ * beyond own-property reads.
+ *
+ * A guest with no such factory is reported, not worked around: the message names the factory and says
+ * what to do about it. A constructor that throws surfaces as jsi::JSError, which the generated
+ * converter turns into a Java exception.
+ */
+static inline jsi::Value jsiHost2JsCallCreateFactory(
+    JNIEnv *env, jsi::Runtime &rt, const char *fq, const char *name, const jsi::Value &fields) {
+  jsi::Value factory = jsiHost2JsFindCreateFactory(rt, name);
+  if (factory.isUndefined()) {
+    std::string message = std::string("host2js: the guest provides no ") + name + " for " + fq +
+                          "; this class shape gets no create-factory (a guest built without "
+                          "create-factories, or a value-class constructor parameter). What the host "
+                          "could see: " + jsiHost2JsRegistrationState(rt, fq);
+    env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), message.c_str());
+    return jsi::Value::undefined();
+  }
+  jsi::Value args[1] = {jsi::Value(rt, fields)};
+  return factory.asObject(rt).asFunction(rt).call(
+      rt, static_cast<const jsi::Value *>(args), static_cast<size_t>(1));
+}
+
 /** A `kotlin.Long` built by the guest, so the guest sees a real Kotlin/JS Long. */
 static inline jsi::Value jsiHost2JsLongToJs(JNIEnv *env, jsi::Runtime &rt, jlong value) {
   jsi::Value factory = jsiHost2JsRuntimeFactory(env, rt, "newLong");
@@ -634,7 +908,9 @@ static inline jsi::Value jsiHost2JsKeyToJs(JNIEnv *env, jsi::Runtime &rt, jobjec
 
   jsi::Value result;
   if (isInstanceOf("java/lang/String")) {
-    result = jsi::String::createFromUtf8(rt, env->GetStringUTFChars(static_cast<jstring>(key), nullptr));
+    // Same encoding boundary as above, and the raw call also leaked the character buffer it
+    // pinned: `GetStringUTFChars` needs a matching release, which this line never had.
+    result = jsi::String::createFromUtf8(rt, zipline::jniStringToUtf8(env, static_cast<jstring>(key)));
   } else if (isInstanceOf("java/lang/Integer") || isInstanceOf("java/lang/Long") ||
              isInstanceOf("java/lang/Short") || isInstanceOf("java/lang/Byte") ||
              isInstanceOf("java/lang/Float") || isInstanceOf("java/lang/Double")) {
@@ -661,9 +937,7 @@ static inline jsi::Value jsiHost2JsKeyToJs(JNIEnv *env, jsi::Runtime &rt, jobjec
       env->DeleteLocalRef(cls);
       return jsi::Value::undefined();
     }
-    const char *chars = env->GetStringUTFChars(s, nullptr);
-    result = jsi::String::createFromUtf8(rt, chars);
-    env->ReleaseStringUTFChars(s, chars);
+    result = jsi::String::createFromUtf8(rt, zipline::jniStringToUtf8(env, s));
     env->DeleteLocalRef(s);
   }
   env->DeleteLocalRef(cls);
@@ -755,9 +1029,9 @@ static inline jsi::Value jsiArrayToJs(JNIEnv *env, jsi::Runtime &rt, jobject arr
   if (env->ExceptionCheck()) return jsi::Value::undefined();
   std::string name;
   if (componentName != nullptr) {
-    const char *chars = env->GetStringUTFChars(componentName, nullptr);
-    name = chars;
-    env->ReleaseStringUTFChars(componentName, chars);
+    // A name in practice, and an ASCII one; converted anyway so that "the bridge hands Hermes
+    // modified UTF-8" is not a rule anyone has to remember in order to read this file.
+    name = zipline::jniStringToUtf8(env, componentName);
     env->DeleteLocalRef(componentName);
   }
 
@@ -849,9 +1123,7 @@ static inline jsi::Value jsiHost2JsAnyToJs(JNIEnv *env, jsi::Runtime &rt, jobjec
 
   if (isInstanceOf("java/lang/String")) {
     jstring s = static_cast<jstring>(obj);
-    const char *chars = env->GetStringUTFChars(s, nullptr);
-    jsi::Value result = jsi::String::createFromUtf8(rt, chars);
-    env->ReleaseStringUTFChars(s, chars);
+    jsi::Value result = jsi::String::createFromUtf8(rt, zipline::jniStringToUtf8(env, s));
     env->DeleteLocalRef(objClass);
     return result;
   }
@@ -897,6 +1169,45 @@ static inline jsi::Value jsiHost2JsAnyToJs(JNIEnv *env, jsi::Runtime &rt, jobjec
   }
   if (isInstanceOf("java/lang/Number")) {
     jsi::Value result = scalar("java/lang/Number", "doubleValue", "()D");
+    env->DeleteLocalRef(objClass);
+    return result;
+  }
+
+  // Kotlin's unsigned scalars are inline classes, so boxed in an `Any` position they arrive as
+  // kotlin.UInt, kotlin.ULong, kotlin.UByte and kotlin.UShort objects. None of them has a
+  // `convertToJs` member, so they reached the virtual dispatch at the bottom of this function and
+  // the host answered `NoSuchMethodError: Lkotlin/UInt;.convertToJs(J)J` -- true, but useless to
+  // whoever saw it. `unbox-impl` is the accessor the compiler generates to unwrap the box, and the
+  // number it returns is the signed bit pattern: the same thing the guest reinterprets on the way
+  // in for a `UInt` field that the generated converter sent, so both routes arrive at one value.
+  if (isInstanceOf("kotlin/UInt")) {
+    jsi::Value result = scalar("kotlin/UInt", "unbox-impl", "()I");
+    env->DeleteLocalRef(objClass);
+    return result;
+  }
+  if (isInstanceOf("kotlin/UByte")) {
+    jsi::Value result = scalar("kotlin/UByte", "unbox-impl", "()B");
+    env->DeleteLocalRef(objClass);
+    return result;
+  }
+  if (isInstanceOf("kotlin/UShort")) {
+    jsi::Value result = scalar("kotlin/UShort", "unbox-impl", "()S");
+    env->DeleteLocalRef(objClass);
+    return result;
+  }
+  if (isInstanceOf("kotlin/ULong")) {
+    jclass unsignedLongClass = env->FindClass("kotlin/ULong");
+    jmethodID unbox = env->GetMethodID(unsignedLongClass, "unbox-impl", "()J");
+    env->DeleteLocalRef(unsignedLongClass);
+    if (env->ExceptionCheck() || unbox == nullptr) {
+      env->DeleteLocalRef(objClass);
+      return jsi::Value::undefined();
+    }
+    // Not a JS number: 64 bits do not fit one, and the `longValue`-style read the `java/lang/Long`
+    // arm above uses would quietly round away the low bits of a value like 1.8e19. Hand the guest a
+    // real Kotlin/JS `Long` carrying the same bits, which is also what the Kotlin/Native host does,
+    // so the two hosts agree on the wire for this type as well.
+    jsi::Value result = jsiHost2JsLongToJs(env, rt, env->CallLongMethod(obj, unbox));
     env->DeleteLocalRef(objClass);
     return result;
   }

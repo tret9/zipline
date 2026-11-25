@@ -80,6 +80,13 @@ class BridgeEndToEndTest {
   }
 
   @Test
+  fun bridgedSizedEnumHolder() {
+    // The guest's entry crosses as an ordinal; the host resolves its own entry, which holds the
+    // label and size its own revision initialized. Both the entry and its payload are asserted.
+    assertEquals(BridgedTestValues.sizedHolder, evalOne("provideBridgedSizedEnumHolder"))
+  }
+
+  @Test
   fun bridgedListHolder() {
     assertEquals(BridgedTestValues.listHolder, evalOne("provideBridgedListHolder"))
   }

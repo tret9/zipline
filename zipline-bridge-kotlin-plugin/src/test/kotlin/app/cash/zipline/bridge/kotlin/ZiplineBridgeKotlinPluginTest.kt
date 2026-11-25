@@ -21,6 +21,7 @@ import com.tschuchort.compiletesting.SourceFile
 import kotlin.io.path.createTempDirectory
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 import org.jetbrains.kotlin.backend.common.extensions.IrGenerationExtension
 import org.jetbrains.kotlin.compiler.plugin.CompilerPluginRegistrar
@@ -114,23 +115,45 @@ class ZiplineBridgeKotlinPluginTest {
 
       // String field conversion
       assertTrue(content.contains("std::string str_name = js_name.asString(rt).utf8(rt);"))
-      assertTrue(content.contains("NewStringUTF(str_name.c_str())"))
+      // Not `NewStringUTF`: JNI's encoding is Java's modified UTF-8 while Hermes produced standard
+      // UTF-8 one line above, which truncates at a NUL and mangles anything above U+FFFF. The
+      // conversion goes through UTF-16, so the generated C must not contain the raw call.
+      assertTrue(content.contains("zipline::utf8ToJniString(env, str_name)"))
+      assertFalse(content.contains("NewStringUTF"))
 
       // Int field conversion
       assertTrue(content.contains("jsi_value_get_int(js_age)"))
 
       // Class and constructor lookup
       assertTrue(content.contains("FindClass"))
-      assertTrue(content.contains("GetMethodID"))
+      assertTrue(content.contains("jsiGetMethodIdQuiet"))
       assertTrue(content.contains("\"()V\""))
 
       // Object construction
       assertTrue(content.contains("NewObject"))
 
       // Field setting
-      assertTrue(content.contains("GetFieldID"))
+      assertTrue(content.contains("jsiGetFieldIdQuiet"))
       assertTrue(content.contains("SetObjectField(result, _fld_name, java_name)"))
       assertTrue(content.contains("SetIntField(result, _fld_age, java_age)"))
+
+      // Host-missing body field: a NULL cached field ID (GetFieldID failed at load) throws the
+      // mismatch before any JS read, so structural skew surfaces as a catchable exception rather
+      // than a silent default or a Hermes abort. The guard precedes the JS property read.
+      assertTrue(
+        content.contains("if (_fld_name == NULL) {"),
+        "missing host-field guard, content was: $content",
+      )
+      assertTrue(
+        content.contains("jsiThrowHostFieldMissing(env, \"com.example.Bridged\", \"name\")"),
+        "missing host-field throw, content was: $content",
+      )
+      val guardIdx = content.indexOf("if (_fld_name == NULL) {")
+      val readIdx = content.indexOf("getProperty(rt, \"name\")")
+      assertTrue(
+        guardIdx in 0 until readIdx,
+        "guard must precede the JS property read (guard=$guardIdx read=$readIdx)",
+      )
 
       // Return
       assertTrue(content.contains("return result;"))
@@ -545,13 +568,18 @@ class ZiplineBridgeKotlinPluginTest {
 
       val content = cFile.readText()
 
-      // C type is jstring (same as non-null String)
-      assertTrue(content.contains("jstring java_name;"))
+      // C type is jstring (same as non-null String); the `= null` default makes it a defaulted
+      // field, so the local is placeholder-initialized and the SetField is skipped when undefined.
+      assertTrue(content.contains("jstring java_name = NULL;"))
 
       // Null check wrapping string extraction
       assertTrue(content.contains("!js_name.isUndefined() && !js_name.isNull()"))
       assertTrue(content.contains("std::string str_name = js_name.asString(rt).utf8(rt);"))
-      assertTrue(content.contains("NewStringUTF(str_name.c_str())"))
+      // Not `NewStringUTF`: JNI's encoding is Java's modified UTF-8 while Hermes produced standard
+      // UTF-8 one line above, which truncates at a NUL and mangles anything above U+FFFF. The
+      // conversion goes through UTF-16, so the generated C must not contain the raw call.
+      assertTrue(content.contains("zipline::utf8ToJniString(env, str_name)"))
+      assertFalse(content.contains("NewStringUTF"))
 
       // Null branch sets to NULL
       assertTrue(content.contains("java_name = NULL;"))
@@ -590,11 +618,12 @@ class ZiplineBridgeKotlinPluginTest {
 
       val content = cFile.readText()
 
-      // C type is jobject (not jint) for nullable primitive
-      assertTrue(content.contains("jobject java_age;"))
+      // C type is jobject (not jint) for nullable primitive; the `= null` default makes it a
+      // defaulted field, so the local is placeholder-initialized.
+      assertTrue(content.contains("jobject java_age = NULL;"))
 
       // Pre-lookup of boxed class and constructor
-      assertTrue(content.contains("FindClass(\"java/lang/Integer\")"))
+      assertTrue(content.contains("jsiFindClassQuiet(env, \"java/lang/Integer\")"))
       assertTrue(content.contains("_boxed_age"))
       assertTrue(content.contains("_boxedCtor_age"))
 
@@ -657,10 +686,12 @@ class ZiplineBridgeKotlinPluginTest {
       // Null branch
       assertTrue(content.contains("java_child = NULL;"))
 
-      // Label (non-null string) does NOT get null check
+      // Label is non-nullable: it must not carry a null-tolerance check. (It is defaulted via
+      // `= ""`, so it does get the undefined-skip guard, but a present null still fails the tag
+      // check — the loud invariant holds.)
       assertTrue(
-        content.indexOf("js_label.isUndefined()") == -1,
-        "Non-nullable label field should not have null check",
+        content.indexOf("js_label.isNull()") == -1,
+        "Non-nullable label field should not have a null check",
       )
     } finally {
       outputDir.toFile().deleteRecursively()
@@ -860,7 +891,7 @@ class ZiplineBridgeKotlinPluginTest {
       val content = cFile.readText()
 
       // JNI takes the internal class name; a dotted one is an illegal class name on ART.
-      assertTrue(content.contains("FindClass(\"com/example/protocol/TargetImpl\")"), content)
+      assertTrue(content.contains("jsiFindClassQuiet(env, \"com/example/protocol/TargetImpl\")"), content)
       assertFalse(content.contains("FindClass(\"com.example.protocol.TargetImpl\")"))
       assertTrue(content.contains("JNIEXPORT jlong JNICALL Java_com_example_protocol_TargetImpl_convertToJs"), content)
 
@@ -871,6 +902,17 @@ class ZiplineBridgeKotlinPluginTest {
       assertTrue(content.contains("addBridgeEntry(\"com.example.protocol.TargetImpl\""), content)
       assertFalse(content.contains("addBridgeEntry(\"com.example.RemappedHolder\""))
       assertTrue(content.contains("jsiHost2JsNewObject(env, rt, \"com.example.protocol.TargetImpl\")"), content)
+
+      // ... and to the guest's own create-factory for that same resolved name, so the guest's
+      // constructor is what builds the payload. The factory name is derived from the resolved FQN, the
+      // same name the guest registered the prototype under.
+      assertTrue(
+        content.contains(
+          "jsiHost2JsCallCreateFactory(env, rt, \"com.example.protocol.TargetImpl\", " +
+            "\"create_com_example_protocol_TargetImpl\", result)",
+        ),
+        content,
+      )
     } finally {
       outputDir.toFile().deleteRecursively()
     }
@@ -918,6 +960,16 @@ class ZiplineBridgeKotlinPluginTest {
       // Every field is defined as an own data property on the new instance.
       assertTrue(content.contains("jsiHost2JsDefineProperty(rt, result, \"name\", "), content)
       assertTrue(content.contains("jsiHost2JsDefineProperty(rt, result, \"age\", "), content)
+
+      // Then the object is handed to the guest's own factory, unconditionally: there is no stamped
+      // fallback, so a guest that publishes no factory is reported rather than served a lookalike.
+      assertFalse(content.contains("jsiHost2JsHasCreateFactory"), content)
+      assertTrue(
+        content.contains(
+          "jsiHost2JsCallCreateFactory(env, rt, \"com.example.Bridged\", \"create_com_example_Bridged\", result)",
+        ),
+        content,
+      )
 
       // A host2js-only class has no JS-to-host converter, so it is not in the dispatch table.
       assertFalse(content.contains("addBridgeEntry("), content)
@@ -972,9 +1024,14 @@ class ZiplineBridgeKotlinPluginTest {
       )
 
       // FindClass needs the JVM internal name: '$' for the nested class, never the dotted FQN.
-      assertTrue(topContent.contains("FindClass(\"com/example/Alignment\")"), topContent)
       assertTrue(
-        nestedContent.contains("FindClass(\"com/example/LineHeightStyle\$Alignment\")"),
+        topContent.contains("jsiFindClassQuiet(env, \"com/example/Alignment\")"),
+        topContent,
+      )
+      assertTrue(
+        nestedContent.contains(
+          "jsiFindClassQuiet(env, \"com/example/LineHeightStyle\$Alignment\")",
+        ),
         nestedContent,
       )
 
@@ -990,6 +1047,436 @@ class ZiplineBridgeKotlinPluginTest {
         nestedContent.contains("com_example_LineHeightStyle_Alignment_bridge_register("),
         nestedContent,
       )
+    } finally {
+      outputDir.toFile().deleteRecursively()
+    }
+  }
+
+  /**
+   * A defaulted constructor parameter makes the JVM emit a synthetic masked constructor; the host
+   * reaches it by descriptor and passes a flag per parameter, so a guest that omitted a defaulted
+   * field still gets the host's own default instead of a failed read.
+   */
+  @Test
+  fun `defaulted ctor param generates masked ctor call`() {
+    val outputDir = createTempDirectory("zipline-bridge-test")
+    try {
+      val result = compileWithCOutputDir(
+        sourceFile = SourceFile.kotlin(
+          "Dflt.kt",
+          """
+          package com.example
+
+          import app.cash.zipline.bridge.support.WithJS2HostBridge
+
+          @WithJS2HostBridge
+          class Dflt(val a: Int, val b: String = "dflt")
+          """,
+        ),
+        cOutputDir = outputDir.toString(),
+      )
+      assertEquals(KotlinCompilation.ExitCode.OK, result.exitCode, result.messages)
+
+      val content = outputDir.resolve("com_example_Dflt.cpp").toFile().readText()
+
+      // The synthetic defaulted ctor is looked up with the mask + marker signature.
+      assertTrue(
+        content.contains(
+          "_ctor_default = jsiGetMethodIdQuiet(env, _cls, \"<init>\", " +
+            "\"(ILjava/lang/String;ILkotlin/jvm/internal/DefaultConstructorMarker;)V\")",
+        ),
+        content,
+      )
+      // The defaulted field's undefined-ness is captured in a use_default bool.
+      assertTrue(content.contains("bool use_default_b = js_b.isUndefined();"), content)
+      // The mask is built from the use_default bools.
+      assertTrue(content.contains("int _default_mask0 = (use_default_b ? 2 : 0);"), content)
+      // The masked ctor is selected only when a flag is actually set.
+      assertTrue(content.contains("if ((_default_mask0) != 0 && _ctor_default == NULL) {"), content)
+      assertTrue(
+        content.contains(
+          "env->NewObject(_cls, _ctor_default, java_a, java_b, _default_mask0, (jobject)NULL)",
+        ),
+        content,
+      )
+      // The full ctor is still used for the all-present case.
+      assertTrue(content.contains("env->NewObject(_cls, _ctor, java_a, java_b)"), content)
+    } finally {
+      outputDir.toFile().deleteRecursively()
+    }
+  }
+
+  /**
+   * A defaulted body var's SetField is guarded by `!isUndefined()`: when the guest omits the
+   * field, the host's own initializer survives instead of being clobbered with a placeholder.
+   */
+  @Test
+  fun `defaulted body var skips SetField when undefined`() {
+    val outputDir = createTempDirectory("zipline-bridge-test")
+    try {
+      val result = compileWithCOutputDir(
+        sourceFile = SourceFile.kotlin(
+          "BodyDflt.kt",
+          """
+          package com.example
+
+          import app.cash.zipline.bridge.support.WithJS2HostBridge
+
+          @WithJS2HostBridge
+          class BodyDflt {
+            var a: Int = 0
+            var extra: String = "bx"
+          }
+          """,
+        ),
+        cOutputDir = outputDir.toString(),
+      )
+      assertEquals(KotlinCompilation.ExitCode.OK, result.exitCode, result.messages)
+
+      val content = outputDir.resolve("com_example_BodyDflt.cpp").toFile().readText()
+
+      assertTrue(
+        content.contains("if (!js_a.isUndefined()) {\n        env->SetIntField(result, _fld_a, java_a);"),
+        content,
+      )
+      assertTrue(
+        content.contains(
+          "if (!js_extra.isUndefined()) {\n        env->SetObjectField(result, _fld_extra, java_extra);",
+        ),
+        content,
+      )
+    } finally {
+      outputDir.toFile().deleteRecursively()
+    }
+  }
+
+  /**
+   * A non-defaulted field keeps the loud use-time failure: the tag check rejects undefined and
+   * there is no flag machinery around it.
+   */
+  @Test
+  fun `non-defaulted field keeps loud throw`() {
+    val outputDir = createTempDirectory("zipline-bridge-test")
+    try {
+      val result = compileWithCOutputDir(
+        sourceFile = SourceFile.kotlin(
+          "NoDflt.kt",
+          """
+          package com.example
+
+          import app.cash.zipline.bridge.support.WithJS2HostBridge
+
+          @WithJS2HostBridge
+          class NoDflt(val a: Int, val b: String)
+          """,
+        ),
+        cOutputDir = outputDir.toString(),
+      )
+      assertEquals(KotlinCompilation.ExitCode.OK, result.exitCode, result.messages)
+
+      val content = outputDir.resolve("com_example_NoDflt.cpp").toFile().readText()
+
+      // No masked-ctor machinery for a class with no defaults.
+      assertFalse(content.contains("_ctor_default"), content)
+      assertFalse(content.contains("use_default_"), content)
+      assertFalse(content.contains("_default_mask"), content)
+      // The tag check rejects undefined (C tag 3) for the non-defaulted field.
+      assertTrue(
+        content.contains(
+          "if (tag_b != 4) {\n            jsiThrowFieldMismatch(env, \"com.example.NoDflt\", \"b\", \"a string\", tag_b);",
+        ),
+        content,
+      )
+    } finally {
+      outputDir.toFile().deleteRecursively()
+    }
+  }
+
+  /**
+   * Six defaulted parameters used to fail the build outright. Nothing in the bridge counts them:
+   * both the C host and the native host generate for any count, and neither emits a diagnostic
+   * about how many defaults a class declares.
+   */
+  @Test
+  fun `six defaulted ctor params build on every host`() {
+    val cDir = createTempDirectory("zipline-bridge-c")
+    val nativeDir = createTempDirectory("zipline-bridge-native")
+    try {
+      val six = SourceFile.kotlin(
+        "Six.kt",
+        """
+        package com.example
+
+        import app.cash.zipline.bridge.support.WithJS2HostBridge
+
+        @WithJS2HostBridge
+        class Six(
+          val a: Int = 1,
+          val b: Int = 2,
+          val c: Int = 3,
+          val d: Int = 4,
+          val e: Int = 5,
+          val f: Int = 6,
+        )
+        """,
+      )
+
+      val cResult = compileWithCOutputDir(sourceFile = six, cOutputDir = cDir.toString())
+      assertEquals(KotlinCompilation.ExitCode.OK, cResult.exitCode, cResult.messages)
+      assertFalse(cResult.messages.contains("defaulted constructor"), cResult.messages)
+      val cContent = cDir.resolve("com_example_Six.cpp").toFile().readText()
+      assertTrue(cContent.contains("int _default_mask0 = (use_default_a ? 1 : 0)"), cContent)
+
+      val nativeResult = compileWithNativeOutputDir(
+        sourceFile = six,
+        nativeOutputDir = nativeDir.toString(),
+      )
+      assertEquals(KotlinCompilation.ExitCode.OK, nativeResult.exitCode, nativeResult.messages)
+      assertFalse(nativeResult.messages.contains("defaulted constructor"), nativeResult.messages)
+    } finally {
+      cDir.toFile().deleteRecursively()
+      nativeDir.toFile().deleteRecursively()
+    }
+  }
+
+  /**
+   * A class with more defaulted parameters than one flag word holds is not a special case: the
+   * JVM's masked constructor takes one `int` per 32 parameters, so the bridge emits (and passes)
+   * one flag word per 32, with the overflown parameter landing in the second word's low bit.
+   */
+  @Test
+  fun `defaults beyond one flag word get their own word`() {
+    val outputDir = createTempDirectory("zipline-bridge-test")
+    try {
+      val params = (0 until 40).joinToString(", ") { "val p$it: Int = $it" }
+      val result = compileWithCOutputDir(
+        sourceFile = SourceFile.kotlin(
+          "Wide.kt",
+          """
+          package com.example
+
+          import app.cash.zipline.bridge.support.WithJS2HostBridge
+
+          @WithJS2HostBridge
+          class Wide($params)
+          """,
+        ),
+        cOutputDir = outputDir.toString(),
+      )
+      // 40 defaulted parameters: no diagnostic about counts, and the build simply succeeds.
+      assertEquals(KotlinCompilation.ExitCode.OK, result.exitCode, result.messages)
+
+      val content = outputDir.resolve("com_example_Wide.cpp").toFile().readText()
+
+      // 40 parameters + 2 flag words, matching the descriptor the JVM generated.
+      val wideSig = "(" + "I".repeat(40) + "I".repeat(2) +
+        "Lkotlin/jvm/internal/DefaultConstructorMarker;)V"
+      assertTrue(
+        content.contains("_ctor_default = jsiGetMethodIdQuiet(env, _cls, \"<init>\", \"$wideSig\")"),
+        content,
+      )
+      // Parameter 34 sits in the second word at bit 2: a shift by its raw index would overflow.
+      assertTrue(content.contains("bool use_default_p34 = js_p34.isUndefined();"), content)
+      assertTrue(content.contains("(use_default_p34 ? 4 : 0)"), content)
+      assertTrue(content.contains("int _default_mask0 = "), content)
+      assertTrue(content.contains("int _default_mask1 = (use_default_p32 ? 1 : 0)"), content)
+      assertTrue(
+        content.contains("(_default_mask0 | _default_mask1) != 0 && _ctor_default == NULL"),
+        content,
+      )
+      assertTrue(
+        content.contains("_default_mask0, _default_mask1, (jobject)NULL)"),
+        content,
+      )
+    } finally {
+      outputDir.toFile().deleteRecursively()
+    }
+  }
+
+  @Test
+  fun `mutable constructor property on a host2js enum fails compilation`() {
+    val outputDir = createTempDirectory("zipline-bridge-test")
+    try {
+      val result = compileWithCOutputDir(
+        sourceFile = SourceFile.kotlin(
+          "MutableEnum.kt",
+          """
+          package com.example
+
+          import app.cash.zipline.bridge.support.WithHost2JSBridge
+
+          @WithHost2JSBridge
+          enum class MutableEnum(var count: Int) { A(1) }
+          """,
+        ),
+        cOutputDir = outputDir.toString(),
+      )
+      assertEquals(KotlinCompilation.ExitCode.COMPILATION_ERROR, result.exitCode, result.messages)
+      assertTrue(result.messages.contains("MutableEnum"), result.messages)
+      assertTrue(result.messages.contains("count"), result.messages)
+    } finally {
+      outputDir.toFile().deleteRecursively()
+    }
+  }
+
+  @Test
+  fun `mutable body property on a js2host enum fails compilation`() {
+    val outputDir = createTempDirectory("zipline-bridge-test")
+    try {
+      val result = compileWithCOutputDir(
+        sourceFile = SourceFile.kotlin(
+          "BodyVarEnum.kt",
+          """
+          package com.example
+
+          import app.cash.zipline.bridge.support.WithJS2HostBridge
+
+          @WithJS2HostBridge
+          enum class BodyVarEnum { A; var label: String = "" }
+          """,
+        ),
+        cOutputDir = outputDir.toString(),
+      )
+      assertEquals(KotlinCompilation.ExitCode.COMPILATION_ERROR, result.exitCode, result.messages)
+      assertTrue(result.messages.contains("BodyVarEnum"), result.messages)
+      assertTrue(result.messages.contains("label"), result.messages)
+    } finally {
+      outputDir.toFile().deleteRecursively()
+    }
+  }
+
+  @Test
+  fun `abstract-member enum generates a native bridge`() {
+    val outputDir = createTempDirectory("zipline-bridge-native-test")
+    try {
+      val result = compileWithNativeOutputDir(
+        sourceFile = SourceFile.kotlin(
+          "Op.kt",
+          """
+          package com.example
+
+          import app.cash.zipline.bridge.support.WithJS2HostBridge
+
+          @WithJS2HostBridge
+          enum class Op {
+            PLUS { override fun apply(a: Int, b: Int) = a + b },
+            MINUS { override fun apply(a: Int, b: Int) = a - b };
+            abstract fun apply(a: Int, b: Int): Int
+          }
+          """,
+        ),
+        nativeOutputDir = outputDir.toString(),
+      )
+      assertEquals(KotlinCompilation.ExitCode.OK, result.exitCode, result.messages)
+      val bridgeFile = outputDir.resolve("com_example_Op_bridge_native.kt").toFile()
+      assertTrue(bridgeFile.exists(), "Expected native bridge file at ${bridgeFile.absolutePath}")
+    } finally {
+      outputDir.toFile().deleteRecursively()
+    }
+  }
+
+  @Test
+  fun `abstract-member host2js enum generates a C bridge`() {
+    val outputDir = createTempDirectory("zipline-bridge-test")
+    try {
+      val result = compileWithCOutputDir(
+        sourceFile = SourceFile.kotlin(
+          "Op.kt",
+          """
+          package com.example
+
+          import app.cash.zipline.bridge.support.WithHost2JSBridge
+
+          @WithHost2JSBridge
+          enum class Op {
+            PLUS { override fun apply(a: Int, b: Int) = a + b },
+            MINUS { override fun apply(a: Int, b: Int) = a - b };
+            abstract fun apply(a: Int, b: Int): Int
+          }
+          """,
+        ),
+        cOutputDir = outputDir.toString(),
+      )
+      assertEquals(KotlinCompilation.ExitCode.OK, result.exitCode, result.messages)
+      val cFile = outputDir.resolve("com_example_Op.cpp").toFile()
+      assertTrue(cFile.exists(), "Expected C file at ${cFile.absolutePath}")
+    } finally {
+      outputDir.toFile().deleteRecursively()
+    }
+  }
+
+  @Test
+  fun `parameterised enum generates no field reads in C`() {
+    val outputDir = createTempDirectory("zipline-bridge-test")
+    try {
+      val result = compileWithCOutputDir(
+        sourceFile = SourceFile.kotlin(
+          "ParamEnum.kt",
+          """
+          package com.example
+
+          import app.cash.zipline.bridge.support.WithJS2HostBridge
+
+          @WithJS2HostBridge
+          enum class ParamEnum(
+            private val secret: String,
+            val tags: List<String>,
+            val action: () -> Unit,
+          ) {
+            A("s", listOf("x"), {}),
+          }
+          """,
+        ),
+        cOutputDir = outputDir.toString(),
+      )
+      assertEquals(KotlinCompilation.ExitCode.OK, result.exitCode, result.messages)
+      val cFile = outputDir.resolve("com_example_ParamEnum.cpp").toFile()
+      assertTrue(cFile.exists(), "Expected C file at ${cFile.absolutePath}")
+      val content = cFile.readText()
+      // An enum crosses as an ordinal, never as a field bag: none of the entry's properties are read.
+      assertFalse(content.contains("getProperty(rt, \"secret\")"), content)
+      assertFalse(content.contains("getProperty(rt, \"tags\")"), content)
+      assertFalse(content.contains("getProperty(rt, \"action\")"), content)
+      assertFalse(content.contains("secret_1"), content)
+    } finally {
+      outputDir.toFile().deleteRecursively()
+    }
+  }
+
+  @Test
+  fun `host2js enum generates ordinal-based convertToJs`() {
+    val outputDir = createTempDirectory("zipline-bridge-test")
+    try {
+      val result = compileWithCOutputDir(
+        sourceFile = SourceFile.kotlin(
+          "Color.kt",
+          """
+          package com.example
+
+          import app.cash.zipline.bridge.support.WithHost2JSBridge
+
+          @WithHost2JSBridge
+          enum class Color { RED, GREEN, BLUE }
+          """,
+        ),
+        cOutputDir = outputDir.toString(),
+      )
+      assertEquals(KotlinCompilation.ExitCode.OK, result.exitCode, result.messages)
+      val cFile = outputDir.resolve("com_example_Color.cpp").toFile()
+      assertTrue(cFile.exists(), "Expected C file at ${cFile.absolutePath}")
+      val content = cFile.readText()
+      // The ordinal method is cached, called on the entry, and handed to the guest's create_<fqn>
+      // factory — never a field-stamped lookalike.
+      assertTrue(content.contains("_ordinalMethod = jsiGetMethodIdQuiet(env, _cls, \"ordinal\", \"()I\")"), content)
+      assertTrue(content.contains("env->CallIntMethod(self, _ordinalMethod)"), content)
+      assertTrue(
+        content.contains(
+          "jsiHost2JsCallCreateFactory(env, rt, \"com.example.Color\", " +
+            "\"create_com_example_Color\", jsi::Value(static_cast<int>(ordinal)))",
+        ),
+        content,
+      )
+      assertFalse(content.contains("is an enum"), content)
     } finally {
       outputDir.toFile().deleteRecursively()
     }
@@ -1099,6 +1586,136 @@ fun compileWithNativeOutputDir(
 @OptIn(ExperimentalCompilerApi::class)
 class ZiplineBridgeNativePluginTest {
 
+  /**
+   * The native host constructs through the generated companion factory rather than calling the
+   * constructor itself, because the default expression for a parameter belongs to the code that
+   * declares the class — and on a native host, that is the host. The bridge's job shrinks to saying
+   * which parameters arrived.
+   */
+  @Test
+  fun `a defaulted constructor parameter is constructed through bridgeCreate`() {
+    val content = generatedBridge(
+      "Defaults.kt",
+      "@WithJS2HostBridge class Defaults(val a: Int = 1, val b: String = \"x\", val c: Int)",
+      "Defaults",
+    )
+
+    // One factory call per bridge, and nothing else constructs the class.
+    assertEquals(1, Regex("\\.bridgeCreate\\(").findAll(content).count(), content)
+    assertTrue(content.contains("_bridge.bridgeCreate(_mask0, a = a, b = b, c = c)"), content)
+
+    // The flags come from what the guest sent. A defaulted parameter's bit is its position within
+    // the word, and it is SET WHEN THE PARAMETER DID NOT ARRIVE: a set bit is the factory's
+    // instruction to evaluate the declared default. A required parameter has no bit at all.
+    assertTrue(
+      content.contains("val _mask0 = (if (aSent) 0 else 1) or (if (bSent) 0 else 2)"),
+      content,
+    )
+    assertTrue(
+      content.contains("val bSent = HermesBridge_getValueTag(ctx, bRef) != TAG_UNDEFINED"),
+      content,
+    )
+
+    // Absence is not a type error for a defaulted parameter, so the guard fires only when something
+    // arrived — and a wrong type still names the field, in the same words the C decoder uses.
+    assertTrue(
+      content.contains(
+        "if (aTag != TAG_UNDEFINED && aTag != 1 && aTag != 2) bridgeThrowFieldMismatch",
+      ),
+      content,
+    )
+    // A required parameter keeps the loud read: nothing arrived is still nothing acceptable.
+    assertTrue(
+      content.contains("if (cTag != 1 && cTag != 2) bridgeThrowFieldMismatch"),
+      content,
+    )
+    // A defaulted reference decodes to a null placeholder, which the factory ignores.
+    assertTrue(
+      content.contains("val b = if (HermesBridge_getValueTag(ctx, bRef) == TAG_UNDEFINED"),
+      content,
+    )
+  }
+
+  /** No `when (mask)` tree and no re-expanded defaults: the factory holds them, the bridge does not. */
+  @Test
+  fun `the native bridge branches on presence instead of expanding defaults`() {
+    val content = generatedBridge(
+      "Defaults.kt",
+      "@WithJS2HostBridge class Defaults(val a: Int = 1, val b: String = \"x\")",
+      "Defaults",
+    )
+    assertFalse(content.contains("when (_mask"), content)
+    assertFalse(content.contains("when (mask"), content)
+    // The default expressions are not in the generated file at all: only the factory evaluates them.
+    assertFalse(content.contains("\"x\""), content)
+  }
+
+  /** Past 32 parameters the factory takes a second flag word, and parameter 32 lands in it. */
+  @Test
+  fun `a signature wider than one flag word passes two mask words to the factory`() {
+    val params = (0 until 40).joinToString(", ") { "val p$it: Int = $it" }
+    val content = generatedBridge("Wide.kt", "@WithJS2HostBridge class Wide($params)", "Wide")
+    assertTrue(content.contains("val _bridge = Wide.Bridge"), content)
+    assertTrue(content.contains("_bridge.bridgeCreate(_mask0, _mask1, p0 = p0,"), content)
+    assertTrue(content.contains("val _mask1 = (if (p32Sent) 0 else 1) or (if (p33Sent) 0 else 2)"), content)
+  }
+
+  /**
+   * A host converter builds its value through the `Bridge` holder, which exists only in the compilation
+   * that compiles the class. When a host target resolves a declaring module built without the plugin --
+   * which is what an iOS build of a Redwood generated module did -- the generated file fails with a bare
+   * "unresolved reference 'Bridge'", and nothing in that message says what to change. So the file says
+   * it, on the lines directly above the statement that fails, where the compiler and Xcode will show it.
+   */
+  @Test
+  fun `the generated converter explains a holder that does not resolve`() {
+    val content = generatedBridge(
+      "Bordered.kt",
+      "@WithJS2HostBridge class Bordered(val color: Int = 1, val shape: Int = 2)",
+      "Bordered",
+    )
+
+    val lines = content.lines()
+    // The file imports the class, so the lookup is unqualified: assert on what is emitted, not on
+    // what the package would allow.
+    val call = lines.indexOfFirst { it.contains("val _bridge = ") && it.contains("Bordered.Bridge") }
+    assertTrue(call > 0, "no holder lookup in:\n$content")
+    val hint = lines.indexOfFirst { it.contains("unresolved reference 'Bridge'") }
+    assertTrue(hint > 0, "no explanation of the failure in:\n$content")
+    assertTrue(
+      lines.subList(maxOf(0, call - 8), call).any { it.contains("without the zipline bridge compiler plugin") },
+      "the explanation must sit directly above the statement that fails:\n$content",
+    )
+    // The remedy has to name the thing to go and change, not just the symptom.
+    assertTrue(
+      lines[hint - 1].contains("com.example.Bordered"),
+      "the hint must name the class whose module needs the plugin: ${lines[hint - 1]}",
+    )
+  }
+
+  /**
+   * The factories object is signed with the package of the module's first source file, so a fixed name
+   * makes two modules that share a package declare one signature -- which is how `:wb:live`'s guest
+   * bundle failed to link two Clive modules that both declare in `ru.wildberries.clive.compose`:
+   * "IrClassSymbolImpl is already bound". A stable per-module key is the whole fix, so it is pinned.
+   */
+  @Test
+  fun `the runtime factories object is named for its module`() {
+    val main = runtimeFactoriesClassName(":wb:nodes:main:common")
+    val designSystem = runtimeFactoriesClassName(":wb:nodes:design-system:common")
+    assertNotEquals(main, designSystem, "modules sharing a package must not share the signature")
+    assertEquals(main, runtimeFactoriesClassName(":wb:nodes:main:common"), "the name must be stable")
+    assertTrue(
+      Regex("^[A-Za-z_][A-Za-z0-9_]*$").matches(main),
+      "must be a legal JS identifier, was: $main",
+    )
+    // Two modules named `common` in different places still differ.
+    assertNotEquals(
+      runtimeFactoriesClassName(":core:nodes:foundation:common"),
+      runtimeFactoriesClassName(":wb:features:shelfs:common"),
+    )
+  }
+
   /** Compiles [source] and returns the generated native bridge for [className]. */
   private fun generatedBridge(fileName: String, source: String, className: String): String {
     val outputDir = createTempDirectory("zipline-bridge-native-test")
@@ -1153,8 +1770,8 @@ class ZiplineBridgeNativePluginTest {
     assertTrue(content.contains("HermesBridge_createHandle(ctx, jsValHandle, \"age\")"))
 
     // String conversion frees the C string
-    assertTrue(content.contains("HermesBridge_getValueString(ctx, nameRef)"))
-    assertTrue(content.contains("toKStringFromUtf8()?.also { platform.posix.free(nameStr) }"))
+    assertTrue(content.contains("bridgeJsString(ctx, nameRef)"))
+    assertTrue(content.contains("val name = nameStr!!"))
 
     // Int extraction
     assertTrue(content.contains("HermesBridge_getValueDouble(ctx, ageRef).toInt()"))
@@ -1200,8 +1817,8 @@ class ZiplineBridgeNativePluginTest {
        assertTrue(content.contains("HermesBridge_createHandle(ctx, jsValHandle, \"age\")"))
 
        // String conversion
-       assertTrue(content.contains("HermesBridge_getValueString(ctx, nameRef)"))
-       assertTrue(content.contains("toKStringFromUtf8"))
+       assertTrue(content.contains("bridgeJsString(ctx, nameRef)"))
+       assertTrue(content.contains("bridgeJsString(ctx, "))
 
        // Int extraction
        assertTrue(content.contains("HermesBridge_getValueDouble(ctx, ageRef).toInt()"))
@@ -1327,8 +1944,11 @@ class ZiplineBridgeNativePluginTest {
              "HermesBridge_getValueTag(ctx, nameRef) == TAG_NULL) null else",
          ),
        )
-       assertTrue(content.contains("toKStringFromUtf8"))
-       assertTrue(content.contains("platform.posix.free(nameStr)"))
+       assertTrue(content.contains("bridgeJsString(ctx, "))
+       // The helper owns the buffer it mallocs and frees, so the generated file must not free it
+       // too: doing that again would be a double free, and the old code freed it here because the
+       // conversion was inlined.
+       assertFalse(content.contains("posix.free("))
      } finally {
        outputDir.toFile().deleteRecursively()
      }
@@ -1363,8 +1983,8 @@ class ZiplineBridgeNativePluginTest {
        assertTrue(content.contains("HermesBridge_createHandle(ctx, itemsRef, \"array_1\")"))
        assertTrue(content.contains("conv_items(ctx, itemsArrRef)"))
        assertTrue(content.contains("jsCollectionToKotlin(ctx, jsArrHandle, CollectionKind.LIST)"))
-       assertTrue(content.contains("HermesBridge_getValueString(ctx, element)"))
-       assertTrue(content.contains("toKStringFromUtf8"))
+       assertTrue(content.contains("bridgeJsString(ctx, element)"))
+       assertTrue(content.contains("bridgeJsString(ctx, "))
      } finally {
        outputDir.toFile().deleteRecursively()
      }
@@ -1435,10 +2055,51 @@ class ZiplineBridgeNativePluginTest {
        // an out-of-range ordinal fails loudly instead of throwing an index exception.
        assertTrue(content.contains("jsEnumOrdinal(ctx, jsValHandle)"))
        assertTrue(content.contains("Color.entries.getOrNull(ordinal)"))
-       assertTrue(content.contains("host bridge: ordinal \$ordinal is out of range for Color"))
+      assertTrue(content.contains("host bridge: ordinal \$ordinal is out of range for com.example.Color"))
      } finally {
        outputDir.toFile().deleteRecursively()
      }
+  }
+
+  @Test
+  fun `parameterised enum generates no field reads in native bridge`() {
+    val outputDir = createTempDirectory("zipline-bridge-native-test")
+    try {
+      val result = compileWithNativeOutputDir(
+        sourceFile = SourceFile.kotlin(
+          "ParamEnum.kt",
+          """
+          package com.example
+          import app.cash.zipline.bridge.support.WithJS2HostBridge
+          @WithJS2HostBridge
+          enum class ParamEnum(
+            private val secret: String,
+            val tags: List<String>,
+            val action: () -> Unit,
+          ) {
+            A("s", listOf("x"), {}),
+          }
+          """,
+        ),
+        nativeOutputDir = outputDir.toString(),
+      )
+      assertEquals(KotlinCompilation.ExitCode.OK, result.exitCode, result.messages)
+
+      val ktFile = outputDir.resolve("com_example_ParamEnum_bridge_native.kt").toFile()
+      assertTrue(ktFile.exists())
+
+      val content = ktFile.readText()
+
+      // Enum ordinal extraction, and none of the entry's properties are read: the receiver resolves
+      // its own singleton, which already holds the values its own revision initialized.
+      assertTrue(content.contains("jsEnumOrdinal(ctx, jsValHandle)"))
+      assertTrue(content.contains("ParamEnum.entries.getOrNull(ordinal)"))
+      assertFalse(content.contains("HermesBridge_createHandle(ctx, jsValHandle, \"secret_1\")"), content)
+      assertFalse(content.contains("HermesBridge_createHandle(ctx, jsValHandle, \"tags\")"), content)
+      assertFalse(content.contains("HermesBridge_createHandle(ctx, jsValHandle, \"action\")"), content)
+    } finally {
+      outputDir.toFile().deleteRecursively()
+    }
   }
 
   @Test

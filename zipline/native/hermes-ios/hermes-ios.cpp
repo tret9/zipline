@@ -665,6 +665,12 @@ const char* HermesContext_getLastError(void* context) {
     return g_lastError;
 }
 
+void HermesContext_setHostError(void* context, const char* message) {
+    if (context) {
+        asNativeContext(context)->lastError = message ? message : "";
+    }
+}
+
 int HermesContext_setupOutboundCallChannel(void* context) {
     if (!context) {
         snprintf(g_lastError, sizeof(g_lastError), "Invalid context");
@@ -690,11 +696,23 @@ int HermesContext_setupOutboundCallChannel(void* context) {
 
             ContextNative* ctx = asNativeContext(context);
             if (ctx->outboundCallFn) {
+                // Clear any stale error so the NULL branch below can tell a
+                // Kotlin-side throw (message recorded via
+                // HermesContext_setHostError) from a genuine null result.
+                ctx->lastError.clear();
                 char* result = (char*)ctx->outboundCallFn(context, callJson.c_str());
                 if (result) {
                     jsi::Value jsResult = jsi::String::createFromUtf8(runtime, std::string(result));
                     free(result);
                     return jsResult;
+                }
+                if (!ctx->lastError.empty()) {
+                    // The Kotlin callback caught an exception (e.g. a missing
+                    // serializer) and recorded its message. Re-raise it as a
+                    // JS error so it propagates through JS and surfaces on
+                    // the outer evaluate boundary with its message intact,
+                    // mirroring the JNI path's throwJavaExceptionFromJs.
+                    throw jsi::JSError(runtime, ctx->lastError);
                 }
             }
             return jsi::Value::undefined();
@@ -712,7 +730,13 @@ int HermesContext_setupOutboundCallChannel(void* context) {
 
             ContextNative* ctx = asNativeContext(context);
             if (ctx->outboundDisconnectFn) {
+                // See the call lambda above: a Kotlin-side throw is recorded
+                // on the context and re-raised here as a JS error.
+                ctx->lastError.clear();
                 int result = ctx->outboundDisconnectFn(context, instanceName.c_str());
+                if (!ctx->lastError.empty()) {
+                    throw jsi::JSError(runtime, ctx->lastError);
+                }
                 return jsi::Value(result != 0);
             }
             return jsi::Value(false);
@@ -872,7 +896,8 @@ int HermesBridge_getValueBool(void* context, int handle) {
     return val->isBool() ? (val->asBool() ? 1 : 0) : 0;
 }
 
-char* HermesBridge_getValueString(void* context, int handle) {
+char* HermesBridge_getValueStringUtf8(void* context, int handle, int* outLength) {
+    if (outLength != nullptr) *outLength = 0;
     ContextNative* ctx = asNativeContext(context);
     if (!ctx || !ctx->runtime) return NULL;
     if (handle < 0 || static_cast<size_t>(handle) >= ctx->bridgeHandles.size()) return NULL;
@@ -882,7 +907,21 @@ char* HermesBridge_getValueString(void* context, int handle) {
     if (!val->isString()) return NULL;
 
     std::string s = val->asString(rt).utf8(rt);
-    return strdup(s.c_str());  // caller frees with free()
+    char* copy = static_cast<char*>(malloc(s.size() + 1));  // caller frees with free()
+    if (copy == nullptr) return NULL;
+    // memcpy, not strcpy: the value may contain NUL, and `s.size()` is the whole string. The NUL
+    // byte after it stays for callers that still treat the buffer as a C string.
+    memcpy(copy, s.data(), s.size());
+    copy[s.size()] = '\0';
+    if (outLength != nullptr) *outLength = static_cast<int>(s.size());
+    return copy;
+}
+
+char* HermesBridge_getValueString(void* context, int handle) {
+    // Kept for callers that read names (property and class names, which cannot contain NUL).
+    // Anything carrying user text must use HermesBridge_getValueStringUtf8: the length this call
+    // computes and discards is exactly what a NUL-containing value needs.
+    return HermesBridge_getValueStringUtf8(context, handle, nullptr);
 }
 
 void HermesBridge_freeHandle(void* context, int handle) {
@@ -1023,6 +1062,77 @@ void HermesBridge_clearHandles(void* context) {
     ctx->bridgeHandles.clear();
 }
 
+// Copy every property of [source] that the host could read on it -- own or inherited -- onto
+// [target], so that every bridged module's factories stay reachable in one global object.
+// jsi::Object has no copy or move constructor, so both handles come in by reference.
+static // Mirrors the same two helpers in ContextJni.cpp for the JVM host; the registration hook is duplicated
+// across these two files, so its diagnostics are too.
+// Records that a guest registration arrived unusable, and what arrived, into a global the host reads
+// back after each module load. Recorded rather than thrown: the guest wraps its own
+// `__bridgeRegisterRuntime` call in a tolerant try/catch, so an exception raised here cannot escape --
+// the defect survives to a much later host->JS conversion as "the guest provides no create_<fqn>",
+// naming neither the module nor the reason. Only the first problem is kept: it is the one that
+// happened, everything after it is downstream.
+static void recordFactoriesProblem(jsi::Runtime &rt, const std::string &detail) {
+    try {
+        if (rt.global().getProperty(rt, "__zipline_bridgeFactoriesProblem").isString()) return;
+        // The bad registration is attributed to the module that was loading, which the loader keeps
+        // in this global (CURRENT_MODULE_ID in hostMain's defineJs.kt). Without it the report can only
+        // name whichever module the host checked first, and a module that loaded cleanly before the
+        // culprit would be blamed for it.
+        std::string message = detail;
+        jsi::Value loading = rt.global().getProperty(rt, "app_cash_zipline_currentModuleId");
+        if (loading.isString()) message += " (while loading " + loading.asString(rt).utf8(rt) + ")";
+        rt.global().setProperty(
+            rt, "__zipline_bridgeFactoriesProblem", jsi::String::createFromUtf8(rt, message));
+    } catch (const std::exception &) {
+    }
+}
+
+// jsi::Value cannot be copied, so this takes the hook's argument array rather than a value: the
+// "called with nothing" case has no value to name.
+const char *describeBridgeArgument(const jsi::Value *args, size_t argc) {
+    if (argc < 1) return "nothing";
+    const jsi::Value &value = args[0];
+    if (value.isUndefined()) return "undefined";
+    if (value.isNull()) return "null";
+    if (value.isBool()) return "a boolean";
+    if (value.isNumber()) return "a number";
+    if (value.isString()) return "a string";
+    if (value.isSymbol()) return "a symbol";
+    return "a value of no recognisable kind";
+}
+
+void mergeBridgeFactories(jsi::Runtime &rt, jsi::Object &target, jsi::Object &source) {
+  // The guest's factories object is a Kotlin/JS `object` instance: newLong, newArrayList and every
+  // create-factory are methods on its PROTOTYPE and are not enumerable, so copying the own enumerable
+  // keys copies nothing at all -- the host would keep an empty map and report "the guest provides no
+  // create_..." for every class. Walk the prototype chain instead, which is what a property read on
+  // the instance does, so whatever the host could find on the instance it can still find here.
+  jsi::Object objectCtor = rt.global().getPropertyAsObject(rt, "Object");
+  jsi::Function getOwnPropertyNames = objectCtor.getPropertyAsFunction(rt, "getOwnPropertyNames");
+  jsi::Function getPrototypeOf = objectCtor.getPropertyAsFunction(rt, "getPrototypeOf");
+  jsi::Value objectPrototype = objectCtor.getProperty(rt, "prototype");
+
+  jsi::Value current = jsi::Value(rt, source);
+  while (current.isObject() && !jsi::Value::strictEquals(rt, current, objectPrototype)) {
+    jsi::Value args[1] = {jsi::Value(rt, current.asObject(rt))};
+    jsi::Object names =
+        getOwnPropertyNames.call(rt, static_cast<const jsi::Value *>(args), static_cast<size_t>(1))
+            .asObject(rt);
+    // Explicit Value indices: a bare integer is ambiguous against jsi::Value's converting
+    // constructors, and this jsi has no Object::get(Runtime&, Value).
+    double count = names.getProperty(rt, "length").asNumber();
+    for (double i = 0; i < count; i++) {
+      jsi::Value name = names.getProperty(rt, jsi::Value(i));
+      std::string key = name.asString(rt).utf8(rt);
+      if (key == "constructor") continue;
+      target.setProperty(
+          rt, jsi::PropNameID::forUtf8(rt, key), current.asObject(rt).getProperty(rt, name));
+    }
+    current = getPrototypeOf.call(rt, static_cast<const jsi::Value *>(args), static_cast<size_t>(1));
+  }
+}
 // -- Bridge dispatch registration (__bridgeRegister) --
 
 static std::vector<std::pair<std::string, void*>> g_iosBridgeTable;
@@ -1104,8 +1214,32 @@ void HermesBridge_installBridgeRegister(void* jsiRuntime) {
         jsi::PropNameID::forUtf8(rt, "__bridgeRegisterRuntime"),
         1,
         [](jsi::Runtime& rt, const jsi::Value&, const jsi::Value* args, size_t argc) -> jsi::Value {
-            if (argc < 1 || !args[0].isObject()) return jsi::Value::undefined();
-            rt.global().setProperty(rt, "__zipline_bridgeFactories", jsi::Value(rt, args[0]));
+            if (argc < 1 || !args[0].isObject()) {
+                recordFactoriesProblem(rt,
+                    std::string("__bridgeRegisterRuntime was called with ") +
+                        describeBridgeArgument(args, argc) +
+                        " instead of a factories object");
+                return jsi::Value::undefined();
+            }
+            // Merge, do not replace: one call per bridged module, and the last module to load must
+            // not delete the create-factories of the modules before it. Mirrors the same hook in
+            // ContextJni.cpp for the JVM host; the prototypes global above has always merged.
+            jsi::Value existing = rt.global().getProperty(rt, "__zipline_bridgeFactories");
+            jsi::Object target = existing.isObject() ? existing.asObject(rt) : [&] {
+                jsi::Object created(rt);
+                rt.global().setProperty(rt, "__zipline_bridgeFactories", jsi::Value(rt, created));
+                return created;
+            }();
+            jsi::Object published = args[0].asObject(rt);
+            // Merged every time; no skip-the-repeat guard, for the reason recorded at length in the
+            // same hook in ContextJni.cpp: a constructor-based guard is not sound, and the cost it
+            // saves is microseconds.
+            mergeBridgeFactories(rt, target, published);
+            jsi::Value newLong = target.getProperty(rt, "newLong");
+            if (!newLong.isObject() || !newLong.asObject(rt).isFunction(rt)) {
+                recordFactoriesProblem(rt,
+                    "the published factories object carries no newLong, so it had no methods to merge");
+            }
             return jsi::Value::undefined();
         });
 
@@ -1194,6 +1328,24 @@ int HermesBridge_createBool(void* context, int value) {
     ContextNative* ctx = asNativeContext(context);
     if (!ctx || !ctx->runtime) return bridgeFailure(ctx, "bridge: invalid context");
     return allocBridgeHandle(ctx, std::make_shared<jsi::Value>(*ctx->runtime, value != 0));
+}
+
+int HermesBridge_createStringUtf8(void* context, const unsigned char* bytes, int length) {
+    ContextNative* ctx = asNativeContext(context);
+    if (!ctx || !ctx->runtime) return bridgeFailure(ctx, "bridge: invalid string");
+    if (bytes == nullptr && length != 0) return bridgeFailure(ctx, "bridge: invalid string");
+    jsi::Runtime& rt = *ctx->runtime;
+    try {
+        std::string value = (bytes != nullptr && length > 0)
+            ? std::string(reinterpret_cast<const char*>(bytes), static_cast<size_t>(length))
+            : std::string();
+        return allocBridgeHandle(ctx,
+            std::make_shared<jsi::Value>(rt, jsi::String::createFromUtf8(rt, std::move(value))));
+    } catch (const jsi::JSError& e) {
+        return bridgeFailure(ctx, e.getMessage());
+    } catch (const std::exception& e) {
+        return bridgeFailure(ctx, e.what());
+    }
 }
 
 int HermesBridge_createString(void* context, const char* utf8) {

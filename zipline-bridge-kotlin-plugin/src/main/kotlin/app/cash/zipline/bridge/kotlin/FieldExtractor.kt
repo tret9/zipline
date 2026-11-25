@@ -1,14 +1,18 @@
 package app.cash.zipline.bridge.kotlin
 
+import org.jetbrains.kotlin.descriptors.ClassKind
 import org.jetbrains.kotlin.ir.declarations.IrClass
 import org.jetbrains.kotlin.ir.declarations.IrConstructor
+import org.jetbrains.kotlin.ir.declarations.IrField
 import org.jetbrains.kotlin.ir.declarations.IrModuleFragment
 import org.jetbrains.kotlin.ir.declarations.IrParameterKind
 import org.jetbrains.kotlin.ir.declarations.IrProperty
+import org.jetbrains.kotlin.ir.declarations.IrValueParameter
+import org.jetbrains.kotlin.ir.expressions.IrExpression
+import org.jetbrains.kotlin.ir.expressions.IrGetValue
 import org.jetbrains.kotlin.ir.types.IrSimpleType
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.IrTypeProjection
-import org.jetbrains.kotlin.ir.types.classFqName
 import org.jetbrains.kotlin.ir.types.getClass
 import org.jetbrains.kotlin.ir.types.isMarkedNullable
 import org.jetbrains.kotlin.ir.util.classId
@@ -89,34 +93,71 @@ internal fun importForType(fqName: String): String {
  * preventing the linker from dead-code eliminating them.
  */
 internal fun extractFields(annotatedClass: IrClass, includeValBodyFields: Boolean = false): List<FieldInfo> {
+  // Enums cross as singleton instances resolved by ordinal, never as a field bag: the host does not
+  // read (guest -> host) or send (host -> guest) any of the entry's properties, because the receiver
+  // resolves its own entry and that entry already holds the values its own revision initialized.
+  // Extracting fields for an enum would only emit dead property reads, tag checks, and collection
+  // helper functions — and, on a parameterised enum with a function-typed `val`, would make the
+  // generator skip the converter altogether.
+  if (annotatedClass.kind == ClassKind.ENUM_CLASS) return emptyList()
+
   val primaryConstructor = annotatedClass.declarations
     .filterIsInstance<IrConstructor>()
     .firstOrNull { it.isPrimary }
-  val primaryConstructorParamNames = primaryConstructor
+  val primaryConstructorParams = primaryConstructor
     ?.parameters
     ?.filter { it.kind == IrParameterKind.Regular }
-    ?.map { it.name.asString() }
-    ?.toSet() ?: emptySet()
+    ?.associateBy { it.name.asString() }
+    ?: emptyMap()
 
   return annotatedClass.properties.mapNotNull {
-    extractField(it, primaryConstructorParamNames, includeValBodyFields)
+    extractField(it, primaryConstructorParams, includeValBodyFields)
   }.toList()
 }
 
-private fun extractField(property: IrProperty, primaryConstructorParamNames: Set<String>, includeValBodyFields: Boolean): FieldInfo? {
+private fun extractField(property: IrProperty, primaryConstructorParams: Map<String, IrValueParameter>, includeValBodyFields: Boolean): FieldInfo? {
   val type = property.getter?.returnType ?: return null
   val name = property.name.asString()
-  val isConstructorParam = name in primaryConstructorParamNames
+  val isConstructorParam = name in primaryConstructorParams
 
   if (!isConstructorParam && !property.hasBackingField()) return null
   if (!isConstructorParam && !property.isVar && !includeValBodyFields) return null
+
+  // Default detection. A constructor-parameter field reports the primary-constructor parameter's
+  // defaultValue. A body field resolves its backing field through overrides (the same traversal as
+  // hasBackingField(): the IR fake-override's own backingField is null, so an inherited field must
+  // be read from the real owner). A fake-override's backing-field initializer is the base
+  // constructor's assignment `this.x = x` — a bare get of the base's IrValueParameter, NOT a field
+  // default. Treating that get as a default would wrongly mark a non-defaulted inherited field as
+  // defaulted and silently drop its loud use-time failure. The real default is that parameter's own
+  // defaultValue (null when the base parameter is not defaulted).
+  val defaultExpr: IrExpression? = if (isConstructorParam) {
+    primaryConstructorParams[name]?.defaultValue?.expression
+  } else {
+    val init = property.resolveBackingField()?.initializer?.expression
+    val baseParam = (init as? IrGetValue)?.symbol?.owner as? IrValueParameter
+    if (baseParam != null) baseParam.defaultValue?.expression else init
+  }
+  val hasDefault = defaultExpr != null
 
   return FieldInfo(
     name = name,
     type = type,
     isConstructorParam = isConstructorParam,
     jsPropertyName = property.jsName(),
+    hasDefault = hasDefault,
   )
+}
+
+/**
+ * The backing field for [property], following the override chain to the nearest non-interface owner
+ * when this declaration is a fake override (its own `backingField` is null). Mirrors the traversal
+ * in [hasBackingField]; returns null when no class in the chain owns a backing field.
+ */
+private fun IrProperty.resolveBackingField(): IrField? {
+  backingField?.let { return it }
+  val overridden = overriddenSymbols.singleOrNull { !it.owner.parentAsClass.isInterface }?.owner
+  return overridden?.resolveBackingField()
 }
 
 private fun IrProperty.hasBackingField(): Boolean = backingField != null ||
