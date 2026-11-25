@@ -2,6 +2,7 @@ package app.cash.zipline.bridge.kotlin
 
 import org.jetbrains.kotlin.ir.declarations.IrClass
 import org.jetbrains.kotlin.ir.declarations.IrConstructor
+import org.jetbrains.kotlin.ir.declarations.IrDeclarationOrigin
 import org.jetbrains.kotlin.ir.declarations.IrModuleFragment
 import org.jetbrains.kotlin.ir.declarations.IrParameterKind
 import org.jetbrains.kotlin.ir.declarations.IrProperty
@@ -17,6 +18,7 @@ import org.jetbrains.kotlin.ir.util.hasAnnotation
 import org.jetbrains.kotlin.ir.util.isInterface
 import org.jetbrains.kotlin.ir.util.parentAsClass
 import org.jetbrains.kotlin.ir.util.properties
+import org.jetbrains.kotlin.name.ClassId
 
 // -- Field extraction and class discovery (shared between C, Native, and JS generators) --
 
@@ -104,6 +106,17 @@ internal fun extractFields(annotatedClass: IrClass, includeValBodyFields: Boolea
 }
 
 private fun extractField(property: IrProperty, primaryConstructorParamNames: Set<String>, includeValBodyFields: Boolean): FieldInfo? {
+  // Declarations made by the compiler or a compiler plugin are plumbing, never authored payload
+  // state: a `@Serializable object` keeps its serializer in a generated `$cachedSerializer`
+  // property, whose Kotlin/Native origin is synthetic. Converters must not carry it, and the
+  // safety checks must not report it.
+  if (property.origin.isSynthetic || property.origin is IrDeclarationOrigin.GeneratedByPlugin) return null
+
+  // A delegated property keeps its value in a `<name>$delegate` field typed by the delegate, not
+  // in a field named after the property. The JVM converters address state by field name, so a
+  // delegate cannot cross as a field; the guest computes or reads the value through its accessor.
+  if (property.isDelegated) return null
+
   val type = property.getter?.returnType ?: return null
   val name = property.name.asString()
   val isConstructorParam = name in primaryConstructorParamNames
@@ -135,16 +148,28 @@ private fun IrProperty.jsName(): String {
   return if (isPrivate || isInlineClass(parentAsClass)) "${kotlinName}_1" else kotlinName
 }
 
-internal fun hasWithJS2HostBridgeAnnotation(irClass: IrClass): Boolean {
-  return irClass.annotations.any {
-    it.symbol.owner.returnType.getClass()?.classId == WITH_JS2HOST_BRIDGE_CLASS_ID
-  }
-}
+/**
+ * Whether [irClass] carries `@WithJS2HostBridge`, directly or via an ancestor. Bridge
+ * annotations are sticky: a subclass is discovered, given a converter, and validated as if it
+ * carried the annotation itself, so the crossing guarantee holds across the whole hierarchy.
+ */
+internal fun hasWithJS2HostBridgeAnnotation(irClass: IrClass): Boolean = carriesBridgeAnnotation(irClass, WITH_JS2HOST_BRIDGE_CLASS_ID)
 
-internal fun hasWithHost2JSBridgeAnnotation(irClass: IrClass): Boolean {
-  return irClass.annotations.any {
-    it.symbol.owner.returnType.getClass()?.classId == WITH_HOST2JS_BRIDGE_CLASS_ID
+/** Whether [irClass] carries `@WithHost2JSBridge`, directly or via an ancestor. */
+internal fun hasWithHost2JSBridgeAnnotation(irClass: IrClass): Boolean = carriesBridgeAnnotation(irClass, WITH_HOST2JS_BRIDGE_CLASS_ID)
+
+/**
+ * Walks [irClass] and its supertypes looking for [annotationId]. The visited set guards
+ * against cyclic hierarchies.
+ */
+private fun carriesBridgeAnnotation(irClass: IrClass, annotationId: ClassId): Boolean {
+  val visited = mutableSetOf<IrClass>()
+  fun walk(clazz: IrClass): Boolean {
+    if (!visited.add(clazz)) return false
+    if (clazz.annotations.any { it.symbol.owner.returnType.getClass()?.classId == annotationId }) return true
+    return clazz.superTypes.any { (it as? IrSimpleType)?.getClass()?.let(::walk) == true }
   }
+  return walk(irClass)
 }
 
 /** Check if an [IrClass] is an inline value class. */
