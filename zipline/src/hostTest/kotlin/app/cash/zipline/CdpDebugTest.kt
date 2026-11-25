@@ -28,6 +28,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.newSingleThreadContext
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okio.EOFException
 import okio.IOException
 
@@ -231,6 +236,38 @@ class CdpDebugTest {
       cdp.awaitResponse(3)
       cdp.send(4, "Profiler.stop")
       assertTrue(cdp.awaitResponse(4).contains("\"profile\""))
+    }
+  }
+
+  /**
+   * A heap snapshot arrives as many `HeapProfiler.addHeapSnapshotChunk` events before the
+   * `takeHeapSnapshot` response. The server must send them in order, or the joined chunks are not
+   * the snapshot.
+   */
+  @Test
+  fun heapSnapshotChunksArriveInOrder() = runBlocking<Unit> {
+    val zipline = Zipline.create(dispatcher)
+    this@CdpDebugTest.zipline = zipline
+    withContext(dispatcher) {
+      zipline.jsEngine.execute(testScriptBytecode, SCRIPT_URL)
+    }
+    val sessionId = discoverSessionId()
+
+    CdpTestClient.connect(PORT, sessionId).use { cdp ->
+      cdp.send(1, "HeapProfiler.takeHeapSnapshot", """"params":{"reportProgress":false}""")
+      val chunks = mutableListOf<String>()
+      while (true) {
+        val message = Json.parseToJsonElement(assertNotNull(cdp.nextEvent(timeoutMs = 30_000))).jsonObject
+        if (message["id"]?.jsonPrimitive?.content == "1") break
+        if (message["method"]?.jsonPrimitive?.content == "HeapProfiler.addHeapSnapshotChunk") {
+          chunks += message["params"]!!.jsonObject["chunk"]!!.jsonPrimitive.content
+        }
+      }
+      assertTrue(chunks.size > 1, "the response overtook the chunks: ${chunks.size} chunk(s) before it")
+      val snapshot = Json.parseToJsonElement(chunks.joinToString("")).jsonObject
+      val nodeFields = snapshot["snapshot"]!!.jsonObject["meta"]!!.jsonObject["node_fields"]!!.jsonArray.size
+      val nodeCount = snapshot["snapshot"]!!.jsonObject["node_count"]!!.jsonPrimitive.int
+      assertEquals(nodeCount * nodeFields, snapshot["nodes"]!!.jsonArray.size)
     }
   }
 

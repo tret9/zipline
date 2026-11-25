@@ -8,6 +8,7 @@ import io.ktor.websocket.readText
 import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 
 /**
@@ -21,38 +22,42 @@ internal class KtorWebSocketClientConnection(
 ) : CdpClientConnection {
   private val open = AtomicBoolean(true)
 
-  override fun sendText(text: String) {
-    if (!open.load()) return
+  /**
+   * Frames in the order they were sent. One coroutine writes them: CDP messages must reach the
+   * client in order, e.g. every `HeapProfiler.addHeapSnapshotChunk` before the
+   * `takeHeapSnapshot` response.
+   */
+  private val outgoing = Channel<Frame>(Channel.UNLIMITED)
+
+  init {
     scope.launch {
-      try {
-        ws.send(Frame.Text(text))
-        ws.flush()
-      } catch (_: Throwable) {
-        open.store(false)
+      for (frame in outgoing) {
+        try {
+          ws.send(frame)
+          ws.flush()
+        } catch (_: Throwable) {
+          open.store(false)
+        }
+        if (frame is Frame.Close) break
       }
     }
   }
 
-  suspend fun sendPong(data: ByteArray) {
-    try {
-      ws.send(Frame.Pong(data))
-      ws.flush()
-    } catch (_: Throwable) {
-      open.store(false)
-    }
+  override fun sendText(text: String) {
+    if (!open.load()) return
+    outgoing.trySend(Frame.Text(text))
+  }
+
+  fun sendPong(data: ByteArray) {
+    outgoing.trySend(Frame.Pong(data))
   }
 
   override fun isOpen(): Boolean = open.load()
 
   override fun closeQuietly() {
     if (open.compareAndSet(true, false)) {
-      scope.launch {
-        try {
-          ws.send(Frame.Close())
-          ws.flush()
-        } catch (_: Throwable) {
-        }
-      }
+      outgoing.trySend(Frame.Close())
+      outgoing.close()
     }
   }
 }
