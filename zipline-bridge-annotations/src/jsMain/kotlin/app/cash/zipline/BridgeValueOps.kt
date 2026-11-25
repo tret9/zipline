@@ -106,3 +106,51 @@ public fun publishValueOps() {
     """,
   )
 }
+
+/**
+ * Whether the host's payload object carries [key] as an OWN property, for the `host→guest`
+ * create-factory the bridge plugin generates. Two distinctions, both load-bearing:
+ *
+ *  * Presence, not truthiness — a host that sent `null` or `0` sent a value, and the parameter must
+ *    take that value rather than the guest-side default.
+ *  * Own, not reachable via `in` — the host writes its fields onto an object that carries the guest
+ *    class's own prototype (reusing what the pre-factory path already built, rather than asking each
+ *    host for a primitive to make a bare `{}`), so `key in target` would answer yes for anything the
+ *    prototype carries and the factory would hand the constructor a method where a value belongs.
+ *    Only the host's own data properties are a sent value.
+ *
+ * This is the guest's copy of the question the JVM host asks with a JNI field lookup and the
+ * Kotlin/Native host asks with `HermesBridge_getValueTag(...) == TAG_UNDEFINED`; all three feed the
+ * same flag word.
+ *
+ * Top-level and public so the plugin resolves it by [org.jetbrains.kotlin.name.CallableId] from this
+ * module's compile classpath, exactly like [publishValueOps]: an unresolvable reference here must be a
+ * compile error in a module that names this library, not a missing property at run time.
+ */
+public fun bridgeHas(target: Any?, key: String): Boolean = js("Object.prototype.hasOwnProperty.call(target, key)")
+
+/**
+ * Read [key] off the host's payload object, for the same factory.
+ *
+ * No type check: the host converted the value into the guest's JS shape when it built the object, so
+ * the factory casts straight to the constructor-parameter type. A host that sent the wrong shape is a
+ * skew failure the guest will hit the moment it uses the value — the same exposure `bridgeGet` has
+ * nowhere else to sit, since the guest cannot re-check a value the host already serialised.
+ */
+public fun bridgeGet(target: Any?, key: String): Any? = js("target[key]")
+
+/**
+ * A wire number into a `Char`, for the same factory.
+ *
+ * A cast will not do it. Kotlin/JS has no `Byte` or `Short` at run time — those are numbers, and
+ * `bridgeGet(...) as Byte` costs nothing — but `Char` is an inline class there, so casting a number to
+ * it answers with something the constructor cannot use: measured, a host's `'z'` arrived as
+ * `'\u0000'` and a `'X'` under `Char?` as `null`, silently, with no failure anywhere on the way.
+ * So the code point is taken out of the number and the wrapper built, which is what `Int.toChar()`
+ * does with the compiler's own knowledge of the representation — the same reason the factory builds
+ * value-class wrappers rather than casting to them.
+ *
+ * `Byte` and `Short` deliberately have no counterpart here: the cast is correct for them, and a helper
+ * would only obscure which of the three types needs building.
+ */
+public fun bridgeChar(value: Any?): Char = value!!.unsafeCast<Double>().toInt().toChar()

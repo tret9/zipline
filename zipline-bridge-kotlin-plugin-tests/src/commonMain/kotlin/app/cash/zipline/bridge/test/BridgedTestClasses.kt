@@ -53,6 +53,30 @@ enum class BridgedEnum { FIRST, SECOND, THIRD }
 data class BridgedEnumHolder(val value: BridgedEnum)
 
 /**
+ * An enum whose entries carry data, which is what an enum looks like in real designs (a label and a
+ * size the widgets read). `BridgedEnum` above has no parameters, so without this fixture nothing in the
+ * suite distinguishes the two shapes.
+ *
+ * What the bridge does with it today: the guest's value crosses as an ordinal and the host resolves
+ * `values()[ordinal]`. So the entry's fields are never read, and no constructor runs on the host's
+ * behalf at all. That is *not* a proof that the crossing is correct -- see the two notes on
+ * `BridgeEndToEndTest.bridgedSizedEnumHolder`. The entry arguments here are deliberately distinct from
+ * each other so that a test can compare payloads across the crossing once there is something to compare.
+ *
+ * CLV-180 owns the behaviour; these fixtures are expected to change with it.
+ */
+@WithJS2HostBridge
+@WithHost2JSBridge
+enum class BridgedSizedEnum(val label: String, val size: Int) {
+  SMALL("small", 12),
+  LARGE("large", 24),
+}
+
+@WithJS2HostBridge
+@WithHost2JSBridge
+data class BridgedSizedEnumHolder(val value: BridgedSizedEnum)
+
+/**
  * Inline classes can only be bridged as fields (or list elements): Kotlin/JS inlines a
  * standalone value-class return value to the underlying primitive, which carries no
  * bridge_dispatch property.
@@ -459,6 +483,8 @@ object BridgedTestValues {
   val nestedInlineHolderNull = BridgedNestedInlineHolder(nested = null)
   val enumSecond = BridgedEnum.SECOND
   val enumHolder = BridgedEnumHolder(value = enumSecond)
+  val sizedLarge = BridgedSizedEnum.LARGE
+  val sizedHolder = BridgedSizedEnumHolder(value = sizedLarge)
   val listHolder = BridgedListHolder(items = listOf(1, 2, 3))
   val callbackHolder = BridgedCallbackHolder(name = "done", onDone = null)
   val floatList = BridgedFloatListHolder(items = listOf(0, 1).map { it.toFloat() } + listOf(0.5f))
@@ -545,4 +571,88 @@ object BridgedTestValues {
   // Distinct values, so a decode that resolves to the wrong class (or to both names) cannot pass.
   val alignmentTopLevel = Alignment(value = 1)
   val alignmentNested = LineHeightStyle.Alignment(value = 2)
+}
+
+/**
+ * The narrow scalars: `Byte`, `Short` and `Char`, plus a nullable one. All three cross as plain
+ * numbers, which is why the gap went unseen: the JNI host reads them with
+ * `SetByteField`/`SetShortField`/`SetCharField` and writes them back with the matching getters, while
+ * the Kotlin/Native decoder had no arm for them at all — they fell through to the generic one, whose
+ * answer is `Any?` against a `Byte` property, so the generated code did not compile. `Char` needs
+ * more than an arm: Kotlin/JS makes it an inline class, so the guest cannot cast a wire number into
+ * one and has to build it (see `bridgeChar`).
+ */
+@WithHost2JSBridge
+@WithJS2HostBridge
+public class BridgedNarrowHolder(
+  public val b: Byte,
+  public val s: Short,
+  public val c: Char,
+  public val opt: Char? = null,
+) {
+  override fun toString(): String = "BridgedNarrowHolder(b=$b, s=$s, c=$c, opt=$opt)"
+}
+
+/**
+ * Every scalar the wire represents as a number but the type system refuses to treat as an `Int`: the
+ * narrow ones (`Byte`, `Short`, `Char`) and the unsigned ones. Values chosen to stress sign and
+ * width — `-1` as a `Byte`, `60_000` in a `Short`-sized field, a `UInt` above `Int.MAX_VALUE`, a
+ * `ULong` above `Long.MAX_VALUE`.
+ *
+ * Task 5.15. The Kotlin/Native host did not compile at all for the `UByte` field (its generated
+ * code produced a `Byte` for a `UByte` property) and refused the `UInt` field outright when the
+ * value reached the guest as an argument (`HOST2JS: no bridge for 'kotlin.UInt'`). `UInt` and
+ * `ULong` worked by accident: the wrapper arms for their underlying `Int` and `Long` happened to
+ * exist, and `inlineWrapperChain` built the wrapper around them.
+ */
+
+@WithHost2JSBridge
+@WithJS2HostBridge
+public class BridgedNarrowScalarProbe(
+  public val b: Byte,
+  public val s: Short,
+  public val c: Char,
+  public val u: UInt,
+  public val ub: UByte,
+  public val us: UShort,
+  public val ul: ULong,
+) {
+  override fun toString(): String = "BridgedNarrowScalarProbe(b=$b, s=$s, c=$c, u=$u, ub=$ub, us=$us, ul=$ul)"
+}
+
+/**
+ * Strings that sit on an encoding boundary: a NUL, a supplementary character, and multi-byte code
+ * points below the surrogate range. The tail is there so that truncation shows up as *missing text*
+ * rather than as a length nobody thought to compare.
+ *
+ * Task 5.16. Java's modified UTF-8 and standard UTF-8 disagree in exactly two places -- NUL and
+ * anything above U+FFFF -- and the JNI bridge was handing one to a consumer expecting the other.
+ */
+@WithHost2JSBridge
+@WithJS2HostBridge
+public class BridgedEncodingProbe(
+  public val s: String,
+  public val tail: String,
+) {
+  override fun toString(): String = "BridgedEncodingProbe(len=${s.length}, last=${s.lastOrNull()?.code ?: -1}, tail=$tail)"
+}
+
+/**
+ * Mutable body properties: not constructor parameters, so not in `bridgeCreate`'s signature, and
+ * assignable only after construction — which means the receiver has to do the assigning, in both
+ * directions. The four types are here on purpose: the absence-tolerant reads answer with null for
+ * some of them and with a zero for others, and a receiver that assigns blindly would write a null
+ * into `extra` or a 0 into `count` whenever a peer predates the property.
+ *
+ * It bridges both ways so the round trip covers the decode as well as the construction.
+ */
+@WithHost2JSBridge
+@WithJS2HostBridge
+public class BridgedMutableBody(public val a: Int) {
+  public var extra: String = "guest-default"
+  public var tags: List<String> = listOf("guest")
+  public var w: BridgedInline = BridgedInline(1)
+  public var count: Int = 0
+
+  override fun toString(): String = "BridgedMutableBody(a=$a, extra=$extra, tags=$tags, w=$w, count=$count)"
 }

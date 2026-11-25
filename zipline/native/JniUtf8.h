@@ -34,8 +34,14 @@ inline void appendUtf8(std::string& out, uint32_t cp) {
 
 // Converts a Java string to standard UTF-8. Unpaired surrogates are
 // replaced with U+FFFD.
+// JNI forbids almost every call while a Java exception is pending: ART's checked JNI aborts the
+// process -- "JNI DETECTED ERROR IN APPLICATION: JNI NewObjectV called with pending exception" --
+// and the trace it prints names this conversion, not the code that threw. Both helpers here are
+// reached straight after JavaScript has called back into Java, which is exactly when an exception
+// can be pending, so each one refuses and lets the pending exception reach Kotlin on its own.
 inline std::string jniStringToUtf8(JNIEnv* env, jstring javaString) {
   if (!javaString) return std::string();
+  if (env->ExceptionCheck()) return std::string();
   const jchar* chars = env->GetStringChars(javaString, nullptr);
   if (!chars) return std::string();
   const jsize length = env->GetStringLength(javaString);
@@ -64,7 +70,12 @@ inline std::string jniStringToUtf8(JNIEnv* env, jstring javaString) {
 // Converts standard UTF-8 to a Java string. Invalid byte sequences are
 // replaced with U+FFFD.
 inline jstring utf8ToJniString(JNIEnv* env, const std::string& utf8) {
-  std::basic_string<jchar> utf16;
+  if (env->ExceptionCheck()) return nullptr;
+  // char16_t, not jchar: jchar is a typedef for uint16_t, and std::char_traits is only
+  // defined by the standard for char, wchar_t, char8_t, char16_t and char32_t. libc++ used
+  // to provide a non-standard base template for other types; NDK r28 (libc++ 19) removed it,
+  // which made this header uncompilable for any consumer using that NDK.
+  std::u16string utf16;
   utf16.reserve(utf8.size());
   size_t i = 0;
   while (i < utf8.size()) {
@@ -107,14 +118,15 @@ inline jstring utf8ToJniString(JNIEnv* env, const std::string& utf8) {
       cp = 0xFFFD;
     }
     if (cp < 0x10000) {
-      utf16 += static_cast<jchar>(cp);
+      utf16 += static_cast<char16_t>(cp);
     } else {
       cp -= 0x10000;
-      utf16 += static_cast<jchar>(0xD800 + (cp >> 10));
-      utf16 += static_cast<jchar>(0xDC00 + (cp & 0x3FF));
+      utf16 += static_cast<char16_t>(0xD800 + (cp >> 10));
+      utf16 += static_cast<char16_t>(0xDC00 + (cp & 0x3FF));
     }
   }
-  return env->NewString(utf16.data(), static_cast<jsize>(utf16.size()));
+  return env->NewString(
+      reinterpret_cast<const jchar*>(utf16.data()), static_cast<jsize>(utf16.size()));
 }
 
 } // namespace zipline
