@@ -806,7 +806,11 @@ android {
     )
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-    consumerProguardFiles("proguard-rules.pro")
+    consumerProguardFiles(
+      "proguard-rules.pro",
+      // The JVM jar ships it from its resources; the AAR doesn't package jniMain resources.
+      "src/jniMain/resources/META-INF/proguard/app_cash_zipline.pro",
+    )
 
     ndk {
       abiFilters += listOf("x86", "x86_64", "armeabi-v7a", "arm64-v8a")
