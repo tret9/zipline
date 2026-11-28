@@ -104,6 +104,18 @@ internal fun extractFields(annotatedClass: IrClass, includeValBodyFields: Boolea
 }
 
 private fun extractField(property: IrProperty, primaryConstructorParamNames: Set<String>, includeValBodyFields: Boolean): FieldInfo? {
+  // A delegated property keeps its value in a `<name>$delegate` field typed by the delegate, not
+  // in a field named after the property. The JVM converters address state by field name, so a
+  // delegate cannot cross as a field; the guest computes or reads the value through its accessor.
+  if (property.isDelegated) return null
+
+  // Properties that the compiler or another plugin generates are not part of the declared payload.
+  // Kotlin/Native puts kotlinx.serialization's serializer cache on a @Serializable object as the
+  // `$cachedSerializer` property, whose backing field holds a Lazy; the JVM keeps the same cache in
+  // the companion object, so only the native converters saw it and failed to convert a Lazy.
+  // Kotlin reserves `$` for generated names, so declared properties never match this filter.
+  if ('$' in property.name.asString()) return null
+
   val type = property.getter?.returnType ?: return null
   val name = property.name.asString()
   val isConstructorParam = name in primaryConstructorParamNames
@@ -116,11 +128,47 @@ private fun extractField(property: IrProperty, primaryConstructorParamNames: Set
     type = type,
     isConstructorParam = isConstructorParam,
     jsPropertyName = property.jsName(),
+    legacyJsName = property.hostNameAlias(),
   )
 }
 
+/** The raw `@HostName` value of [property], empty string included; null when the annotation is absent. */
+internal fun hostNameRaw(property: IrProperty): String? {
+  val annotation = property.annotations.firstOrNull {
+    it.symbol.owner.returnType.getClass()?.classId == HOST_NAME_CLASS_ID
+  } ?: return null
+  val argument = annotation.arguments.getOrNull(0) ?: return null
+  return (argument as? org.jetbrains.kotlin.ir.expressions.IrConst)?.value as? String
+}
+
+/** The `@HostName("old")` value of [property]; null when absent or empty. */
+internal fun hostName(property: IrProperty): String? = hostNameRaw(property)?.takeIf { it.isNotEmpty() }
+
+/**
+ * The JS name [property] carried before `@HostName` renamed it, or null when it was never renamed
+ * (or the annotated value is its current name, where the alias would be the property itself).
+ *
+ * Mangled for the same reason [jsName] is: a private or value-class-backed property carries the
+ * old name in its mangled JS spelling on both sides.
+ */
+internal fun IrProperty.hostNameAlias(): String? {
+  val old = hostName(this) ?: return null
+  val current = jsName()
+  val legacy = jsName(old)
+  return legacy.takeIf { it != current }
+}
+
+/**
+ * The `alias to target` JS name pairs of [clazz]: for every property renamed by `@HostName`, the
+ * name it carried before and the name it carries now. Empty when nothing was renamed.
+ */
+internal fun hostNameAliases(clazz: IrClass): List<Pair<String, String>> = clazz.properties.mapNotNull { property ->
+    val alias = property.hostNameAlias() ?: return@mapNotNull null
+    alias to property.jsName()
+  }.toList()
+
 private fun IrProperty.hasBackingField(): Boolean = backingField != null ||
-      //  TODO(gogabr): should I also check for `isFakeOverride`?
+    //  TODO(gogabr): should I also check for `isFakeOverride`?
     overriddenSymbols.singleOrNull { !it.owner.parentAsClass.isInterface }?.owner?.hasBackingField() == true
 
 // Public properties are read through their JS accessor (defineProp), which keeps the plain
@@ -128,11 +176,10 @@ private fun IrProperty.hasBackingField(): Boolean = backingField != null ||
 // backing fields to name_1, name_2, ... per override level, but the accessor is always the
 // plain name. Only properties without an accessor must be read from their backing field:
 // private properties and value-class boxes (both '_1'-mangled).
-private fun IrProperty.jsName(): String {
-  val kotlinName = name.asString()
+internal fun IrProperty.jsName(name: String = this.name.asString()): String {
   val isPrivate =
     visibility == org.jetbrains.kotlin.descriptors.DescriptorVisibilities.PRIVATE
-  return if (isPrivate || isInlineClass(parentAsClass)) "${kotlinName}_1" else kotlinName
+  return if (isPrivate || isInlineClass(parentAsClass)) "${name}_1" else name
 }
 
 internal fun hasWithJS2HostBridgeAnnotation(irClass: IrClass): Boolean {
